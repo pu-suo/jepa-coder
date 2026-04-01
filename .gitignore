@@ -34,4 +34,8 @@ __pycache__/
 *.sqlite
 
 # Test scripts
-test/
+tests/
+
+# Docs
+docs/
+CLAUDE.md

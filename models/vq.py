@@ -25,6 +25,7 @@ class VectorQuantizer(nn.Module):
         self.dim = dim
         self.commitment_cost = commitment_cost
         self.embedding = nn.Embedding(codebook_size, dim)
+        self.embedding.weight.requires_grad_(False)  # EMA-updated, not gradient-updated
 
         # Codebook usage tracking (Section 2 / Section 7)
         self.register_buffer('usage_count', torch.zeros(codebook_size))
@@ -78,7 +79,7 @@ class VectorQuantizer(nn.Module):
         #   loss = β · ||z - sg[quantized]||²
         # (codebook_loss is handled by update_codebook_ema, not gradient)
         # ============================================
-        commit_loss = F.mse_loss(z, quantized.detach())
+        commit_loss = F.mse_loss(z, quantized.detach().clone())
         loss = self.commitment_cost * commit_loss
 
         # ============================================
