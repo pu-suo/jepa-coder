@@ -168,20 +168,20 @@ def main(limit: int | None = None) -> None:
     tok   = _load_tokenizer()
     stats = Stats()
 
+    # ── Stream directly to JSONL to avoid holding 1.7M rows in memory ────────
     print(f"Processing {INPUT_JSONL} …")
-    rows = list(_process_stream(tok, limit, stats))
+    OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_JSONL, "w", encoding="utf-8") as out_f:
+        for row in _process_stream(tok, limit, stats):
+            out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"Saved JSONL    → {OUTPUT_JSONL}  ({stats.accepted:,} examples)")
 
-    print(f"\nBuilding HuggingFace Dataset ({len(rows):,} examples) …")
-    ds = Dataset.from_list(rows)
+    # ── Build HF Dataset from the JSONL file (no full in-memory list) ────────
+    print(f"Building HuggingFace Dataset from JSONL …")
+    ds = Dataset.from_json(str(OUTPUT_JSONL))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ds.save_to_disk(str(OUTPUT_DIR))
     print(f"Saved HF dataset → {OUTPUT_DIR}/")
-
-    print(f"Writing JSONL → {OUTPUT_JSONL} …")
-    with open(OUTPUT_JSONL, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"Saved JSONL    → {OUTPUT_JSONL}")
 
     _print_stats(stats)
 
