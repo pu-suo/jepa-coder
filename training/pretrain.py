@@ -22,11 +22,16 @@ Hyperparameters (§4 Phase 1):
     Precision    BF16
     Steps        100K (configurable)
     Output       checkpoints/pretrain/pretrained_reasoner.pt
+
+Logging:
+    CSV file at <checkpoint_dir>/training_logs.csv
+    Columns: step, loss, lr, grad_norm, total_tokens
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import math
 import os
@@ -34,7 +39,6 @@ from typing import Iterator, Optional
 
 import torch
 import torch.nn.functional as F
-import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -74,8 +78,6 @@ class PretrainConfig:
     checkpoint_every: int = 2000
 
     # Logging
-    wandb_project: str = "jepa-coder-pretrain"
-    wandb_run_name: Optional[str] = None
     log_every: int = 10
 
 
@@ -294,13 +296,14 @@ def pretrain(config: PretrainConfig) -> None:
     # the iterator starts fresh.  The Stack v2 is large enough that duplicate
     # coverage is negligible across a typical 100K-step run.
 
-    # ── Wandb ───────────────────────────────────────────────────────────────
-    wandb.init(
-        project=config.wandb_project,
-        name=config.wandb_run_name,
-        config=dataclasses.asdict(config),
-        resume="allow",
-    )
+    # ── CSV logger ──────────────────────────────────────────────────────────
+    log_path = os.path.join(config.checkpoint_dir, "training_logs.csv")
+    log_file_existed = os.path.isfile(log_path)
+    log_fh = open(log_path, "a", newline="")
+    log_writer = csv.writer(log_fh)
+    if not log_file_existed:
+        log_writer.writerow(["step", "loss", "lr", "grad_norm", "total_tokens"])
+        log_fh.flush()
 
     # ── Training ────────────────────────────────────────────────────────────
     seqs_per_step = config.seqs_per_accum * config.accum_steps  # 128
@@ -344,15 +347,9 @@ def pretrain(config: PretrainConfig) -> None:
         if completed % config.log_every == 0:
             avg_loss = step_loss / seqs_per_step
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-            wandb.log(
-                {
-                    "train/loss": avg_loss,
-                    "train/lr": lr,
-                    "train/grad_norm": grad_norm_val,
-                    "train/tokens": total_tokens,
-                },
-                step=completed,
-            )
+            log_writer.writerow([completed, f"{avg_loss:.6f}", f"{lr:.8e}",
+                                  f"{grad_norm_val:.6f}", total_tokens])
+            log_fh.flush()
             print(
                 f"step {completed:>7,} | loss {avg_loss:.4f} | lr {lr:.2e} "
                 f"| grad_norm {grad_norm_val:.3f} | tokens {total_tokens:,}"
@@ -378,9 +375,9 @@ def pretrain(config: PretrainConfig) -> None:
         optimizer,
         tag="pretrained_reasoner",
     )
+    log_fh.close()
     final_path = os.path.join(config.checkpoint_dir, "pretrained_reasoner.pt")
     print(f"Pretraining complete. Model saved to {final_path}")
-    wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +394,6 @@ def _parse_args() -> PretrainConfig:
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--c4_mix_ratio", type=float, default=0.2,
                         help="Fraction of samples drawn from C4 (rest from The Stack)")
-    parser.add_argument("--wandb_project", default="jepa-coder-pretrain")
-    parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--log_every", type=int, default=10)
     args = parser.parse_args()
 
@@ -408,8 +403,6 @@ def _parse_args() -> PretrainConfig:
         lr=args.lr,
         warmup_steps=args.warmup_steps,
         c4_mix_ratio=args.c4_mix_ratio,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
         log_every=args.log_every,
     )
 
