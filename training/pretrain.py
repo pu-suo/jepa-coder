@@ -40,6 +40,7 @@ from typing import Iterator, Optional
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from models.reasoner import Reasoner
@@ -309,7 +310,11 @@ def pretrain(config: PretrainConfig) -> None:
     reasoner.train()
     optimizer.zero_grad()
 
-    for step in range(start_step, config.max_steps):
+    print("Warming up data pipeline — first shard download may take 1–2 min...")
+    pbar = tqdm(range(start_step, config.max_steps),
+                initial=start_step, total=config.max_steps,
+                desc="pretrain", unit="step", dynamic_ncols=True)
+    for step in pbar:
         lr = _cosine_lr(step, config.warmup_steps, config.max_steps, config.lr)
         _set_lr(optimizer, lr)
 
@@ -352,6 +357,11 @@ def pretrain(config: PretrainConfig) -> None:
                 f"step {completed:>7,} | loss {avg_loss:.4f} | lr {lr:.2e} "
                 f"| grad_norm {grad_norm_val:.3f} | tokens {total_tokens:,}"
             )
+            pbar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                lr=f"{lr:.2e}",
+                tok=f"{total_tokens / 1e9:.2f}B",
+            )
 
         # ── Checkpoint ──
         if completed % config.checkpoint_every == 0:
@@ -373,6 +383,7 @@ def pretrain(config: PretrainConfig) -> None:
         optimizer,
         tag="pretrained_reasoner",
     )
+    pbar.close()
     log_fh.close()
     final_path = os.path.join(config.checkpoint_dir, "pretrained_reasoner.pt")
     print(f"Pretraining complete. Model saved to {final_path}")
