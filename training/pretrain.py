@@ -151,7 +151,6 @@ def build_data_iterator(config: PretrainConfig, tokenizer) -> Iterator[torch.Ten
         "bigcode/the-stack-v2-dedup",
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
     # Filter to Python — the field name may be 'programming_language' or 'lang'
     stack_ds = stack_ds.filter(
@@ -166,7 +165,6 @@ def build_data_iterator(config: PretrainConfig, tokenizer) -> Iterator[torch.Ten
         "en",
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
 
     text_iter = _text_stream(stack_ds, c4_ds, config.c4_mix_ratio, config.data_seed)
