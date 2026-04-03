@@ -43,3 +43,5 @@ CLAUDE.md
 # Generated Datasets
 data/*.jsonl
 data/sst_dataset/
+
+.env
