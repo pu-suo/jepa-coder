@@ -1,5 +1,5 @@
 """
-training/pretrain.py — Phase 1: Pretraining
+training/pretrain.py — Phase 1: Short Pretraining Run (10K-15K steps)
 
 Specification: docs/jepa_coder_architecture_v2.md §4 Phase 1
 
@@ -10,36 +10,37 @@ Architecture state:
 
 Objective: standard next-token prediction (cross-entropy)
 
-Data (§5.1):
-    bigcode/the-stack-v2-dedup  (Python subset, streaming)
-    allenai/c4                  (en, streaming)
+Data:
+    APPS + TACO + OpenCodeReasoning (local JSONL, pre-tokenized by data pipeline)
+    Interleaves problem text (English) and solution code (Python) to establish
+    angular alignment in the embedding space before SST.
 
 Hyperparameters (§4 Phase 1):
     Optimizer    AdamW
-    LR           3e-4, cosine decay, 2000-step linear warmup
+    LR           3e-4, cosine decay, 1000-step linear warmup
     Eff. batch   128  (32 seqs × 4 accumulation steps)
     Weight decay 0.1
     Precision    BF16
-    Steps        100K (configurable)
+    Steps        15K (stop on loss convergence; monitor via W&B)
     Output       checkpoints/pretrain/pretrained_reasoner.pt
 
 Logging:
-    CSV file at <checkpoint_dir>/training_logs.csv
-    Columns: step, loss, lr, grad_norm, total_tokens
+    Weights & Biases (project: jepa-coder-pretrain)
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import dataclasses
+import json
 import math
 import os
+import random
 from typing import Iterator, Optional
 
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
+import wandb
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
@@ -59,117 +60,84 @@ class PretrainConfig:
     ffn_dim: int = 3072
     context_length: int = 1024
 
-    # Optimizer (§4 Phase 1)
+    # Optimizer
     lr: float = 3e-4
     weight_decay: float = 0.1
-    warmup_steps: int = 2000
-    max_steps: int = 100_000
+    warmup_steps: int = 1000
+    max_steps: int = 15_000
 
-    # Batching: eff. batch = seqs_per_accum * accum_steps = 32 * 4 = 128
+    # Batching: eff. batch = seqs_per_accum * accum_steps = 128
     seqs_per_accum: int = 32
     accum_steps: int = 4
 
-    # Data
-    stack_language_filter: str = "Python"   # field value to match in the Stack
-    c4_mix_ratio: float = 0.2              # fraction of samples drawn from C4
+    # Data — reads from local JSONL produced by data prep pipeline
+    data_dir: str = "/workspace/jepa-coder-data/data"
     data_seed: int = 42
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints/pretrain"
-    checkpoint_every: int = 2000
+    checkpoint_every: int = 1000
 
-    # Logging
+    # Logging — W&B only
     log_every: int = 10
+    wandb_project: str = "jepa-coder-pretrain"
+    wandb_run_name: Optional[str] = None
+
+    # Runtime
+    device: str = "cuda"
+    seed: int = 42
 
 
 # ---------------------------------------------------------------------------
 # Data utilities
 # ---------------------------------------------------------------------------
 
-def _text_stream(
-    stack_ds,
-    c4_ds,
-    c4_mix_ratio: float,
-    seed: int,
-) -> Iterator[str]:
-    """
-    Interleave The Stack and C4 at the given ratio.
-    The Stack items expose their code under 'content'; C4 items under 'text'.
-    """
-    import random
-    rng = random.Random(seed)
-    stack_iter = iter(stack_ds)
-    c4_iter = iter(c4_ds)
-
-    while True:
-        if rng.random() < c4_mix_ratio:
-            try:
-                item = next(c4_iter)
-                yield item.get("text", "")
-            except StopIteration:
-                c4_iter = iter(c4_ds)
-        else:
-            try:
-                item = next(stack_iter)
-                # The Stack v2 uses 'content'; fall back to 'text' if absent
-                yield item.get("content", item.get("text", ""))
-            except StopIteration:
-                stack_iter = iter(stack_ds)
-
-
-def _token_chunks(
-    text_iter: Iterator[str],
+def build_pretrain_data_iterator(
+    config: PretrainConfig,
     tokenizer,
-    context_length: int,
 ) -> Iterator[torch.Tensor]:
     """
-    Tokenize a stream of documents, append EOS between them, and pack into
-    fixed-length chunks of context_length tokens.  Yields LongTensor (context_length,).
-    Leftover tokens that don't fill a full chunk are discarded.
-    """
-    buffer: list[int] = []
-    eos_id: int = tokenizer.eos_token_id
+    Build a token-chunk iterator over APPS + TACO + OpenCodeReasoning data.
 
-    for text in text_iter:
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        ids.append(eos_id)
-        buffer.extend(ids)
+    Reads from config.data_dir/extracted_solutions.jsonl (produced by data prep).
+    Interleaves problem text and solution code so the embeddings learn
+    angular alignment across English and Python.
 
-        while len(buffer) >= context_length:
-            yield torch.tensor(buffer[:context_length], dtype=torch.long)
-            buffer = buffer[context_length:]
-
-
-def build_data_iterator(config: PretrainConfig, tokenizer) -> Iterator[torch.Tensor]:
-    """
-    Build a streaming token-chunk iterator over the mixed pretraining corpus.
     Yields LongTensor of shape (context_length,).
-
-    The Stack v2 is filtered to Python files via the 'programming_language'
-    (or 'lang') metadata field — exact field name depends on the HF snapshot.
     """
-    stack_ds = load_dataset(
-        "bigcode/the-stack-v2-dedup",
-        split="train",
-        streaming=True,
-    )
-    # Filter to Python — the field name may be 'programming_language' or 'lang'
-    stack_ds = stack_ds.filter(
-        lambda x: (
-            x.get("programming_language", x.get("lang", "")).lower()
-            == config.stack_language_filter.lower()
+    jsonl_path = os.path.join(config.data_dir, "extracted_solutions.jsonl")
+    if not os.path.isfile(jsonl_path):
+        raise FileNotFoundError(
+            f"Data file not found: {jsonl_path}\n"
+            "Run scripts/run_data_prep.sh first."
         )
-    )
 
-    c4_ds = load_dataset(
-        "allenai/c4",
-        "en",
-        split="train",
-        streaming=True,
-    )
+    eos_id: int = tokenizer.eos_token_id
+    rng = random.Random(config.data_seed)
 
-    text_iter = _text_stream(stack_ds, c4_ds, config.c4_mix_ratio, config.data_seed)
-    return _token_chunks(text_iter, tokenizer, config.context_length)
+    # Load all records into memory for shuffling; APPS+TACO+OCR is small enough
+    with open(jsonl_path, "r", encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+
+    buffer: list[int] = []
+
+    while True:
+        rng.shuffle(records)
+        for record in records:
+            problem = record.get("problem", record.get("question", ""))
+            solution = record.get("solution", record.get("code", ""))
+
+            # Interleave: problem text then solution code, separated by EOS
+            for text in (problem, solution):
+                if not text:
+                    continue
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                ids.append(eos_id)
+                buffer.extend(ids)
+
+                while len(buffer) >= config.context_length:
+                    yield torch.tensor(buffer[:config.context_length], dtype=torch.long)
+                    buffer = buffer[config.context_length:]
 
 
 # ---------------------------------------------------------------------------
@@ -289,20 +257,14 @@ def pretrain(config: PretrainConfig) -> None:
     _set_lr(optimizer, _cosine_lr(start_step, config.warmup_steps, config.max_steps, config.lr))
 
     # ── Data ────────────────────────────────────────────────────────────────
-    data_iter = build_data_iterator(config, tokenizer)
+    data_iter = build_pretrain_data_iterator(config, tokenizer)
 
-    # For streaming datasets there is no efficient seek, so on a resumed run
-    # the iterator starts fresh.  The Stack v2 is large enough that duplicate
-    # coverage is negligible across a typical 100K-step run.
-
-    # ── CSV logger ──────────────────────────────────────────────────────────
-    log_path = os.path.join(config.checkpoint_dir, "training_logs.csv")
-    log_file_existed = os.path.isfile(log_path)
-    log_fh = open(log_path, "a", newline="")
-    log_writer = csv.writer(log_fh)
-    if not log_file_existed:
-        log_writer.writerow(["step", "loss", "lr", "grad_norm", "total_tokens"])
-        log_fh.flush()
+    # ── W&B ─────────────────────────────────────────────────────────────────
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        config=dataclasses.asdict(config),
+    )
 
     # ── Training ────────────────────────────────────────────────────────────
     seqs_per_step = config.seqs_per_accum * config.accum_steps  # 128
@@ -310,7 +272,7 @@ def pretrain(config: PretrainConfig) -> None:
     reasoner.train()
     optimizer.zero_grad()
 
-    print("Warming up data pipeline — first shard download may take 1–2 min...")
+    print("Loading data from local JSONL...")
     pbar = tqdm(range(start_step, config.max_steps),
                 initial=start_step, total=config.max_steps,
                 desc="pretrain", unit="step", dynamic_ncols=True)
@@ -350,9 +312,13 @@ def pretrain(config: PretrainConfig) -> None:
         if completed % config.log_every == 0:
             avg_loss = step_loss / seqs_per_step
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-            log_writer.writerow([completed, f"{avg_loss:.6f}", f"{lr:.8e}",
-                                  f"{grad_norm_val:.6f}", total_tokens])
-            log_fh.flush()
+            wandb.log({
+                "pretrain/loss": avg_loss,
+                "pretrain/lr": lr,
+                "pretrain/grad_norm": grad_norm_val,
+                "pretrain/tokens_seen": total_tokens,
+                "pretrain/step": completed,
+            }, step=completed)
             print(
                 f"step {completed:>7,} | loss {avg_loss:.4f} | lr {lr:.2e} "
                 f"| grad_norm {grad_norm_val:.3f} | tokens {total_tokens:,}"
@@ -384,7 +350,7 @@ def pretrain(config: PretrainConfig) -> None:
         tag="pretrained_reasoner",
     )
     pbar.close()
-    log_fh.close()
+    wandb.finish()
     final_path = os.path.join(config.checkpoint_dir, "pretrained_reasoner.pt")
     print(f"Pretraining complete. Model saved to {final_path}")
 
@@ -394,25 +360,29 @@ def pretrain(config: PretrainConfig) -> None:
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> PretrainConfig:
-    parser = argparse.ArgumentParser(description="JEPA-Coder Phase 1 Pretraining")
+    parser = argparse.ArgumentParser(description="JEPA-Coder Phase 1 Short Pretraining Run")
     parser.add_argument("--checkpoint_dir", default="checkpoints/pretrain",
                         help="Directory for checkpoints and final model")
-    parser.add_argument("--max_steps", type=int, default=100_000,
-                        help="Total optimizer steps (100K–150K per spec)")
+    parser.add_argument("--data_dir", default="/workspace/jepa-coder-data/data",
+                        help="Directory containing extracted_solutions.jsonl")
+    parser.add_argument("--max_steps", type=int, default=15000,
+                        help="Total optimizer steps (10K-15K; stop on loss convergence)")
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--warmup_steps", type=int, default=2000)
-    parser.add_argument("--c4_mix_ratio", type=float, default=0.2,
-                        help="Fraction of samples drawn from C4 (rest from The Stack)")
+    parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--wandb_project", default="jepa-coder-pretrain")
+    parser.add_argument("--wandb_run_name", default=None)
     args = parser.parse_args()
 
     return PretrainConfig(
         checkpoint_dir=args.checkpoint_dir,
+        data_dir=args.data_dir,
         max_steps=args.max_steps,
         lr=args.lr,
         warmup_steps=args.warmup_steps,
-        c4_mix_ratio=args.c4_mix_ratio,
         log_every=args.log_every,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
     )
 
 

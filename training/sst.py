@@ -136,8 +136,8 @@ def sst_train_step(
 @dataclasses.dataclass
 class SSTConfig:
     # Paths
-    pretrained_checkpoint: str          # path to pretrained_reasoner.pt
-    output_dir: str                     # directory for SST checkpoints
+    pretrained_checkpoint: str          # path to pretrained_reasoner.pt (from Phase 1 short pretraining)
+    output_dir: str                     # directory for SST checkpoints (checkpoints/sst/)
 
     # Model architecture — must match the pretrained checkpoint exactly
     vocab_size: int                     # StarCoder2 BPE vocab (~49K tokens)
@@ -287,7 +287,7 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
 
     raw = torch.load(config.pretrained_checkpoint, map_location='cpu')
     # Support both bare state_dicts and wrapped {'state_dict': ...} checkpoints
-    state_dict = raw.get('state_dict', raw) if isinstance(raw, dict) else raw
+    state_dict = raw.get('model_state_dict', raw.get('state_dict', raw)) if isinstance(raw, dict) else raw
     missing, unexpected = reasoner.load_state_dict(state_dict, strict=False)
     # Only 'lm_head.weight' is expected in unexpected (tied weight, not needed)
     non_lmhead_unexpected = [k for k in unexpected if not k.startswith('lm_head')]
