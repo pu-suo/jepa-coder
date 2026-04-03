@@ -130,8 +130,8 @@ def extract_ocr() -> tuple[list[dict], dict]:
 
     dataset = load_dataset(
         "nvidia/OpenCodeReasoning",
-        split="train",
-        trust_remote_code=True,
+        "split_0",
+        split="split_0"
     )
     print(f"  Processing OCR split: train ({len(dataset)} examples)")
 
