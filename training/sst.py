@@ -15,7 +15,9 @@ Critical invariants enforced here (contract_1_sst_loop.md §4):
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
+import json
 import math
 import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -446,3 +448,53 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
 
     if config.wandb_project:
         wandb.finish()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def sst_data_iterator(jsonl_path: str) -> Iterator[tuple[str, list[dict]]]:
+    """Yield (problem_text, blocks) from a JSONL file produced by prepare_sst_data.py."""
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            yield record["problem"], record["blocks"]
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run SST training phase.")
+    parser.add_argument("--pretrained_checkpoint", type=str, required=True,
+                        help="Path to pretrained_reasoner.pt from Phase 1")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/sst",
+                        help="Directory for SST checkpoints")
+    parser.add_argument("--wandb_project", type=str, default="jepa-coder-sst",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Weights & Biases run name")
+    parser.add_argument("--max_examples", type=int, default=100_000,
+                        help="Maximum number of training examples")
+    args = parser.parse_args()
+
+    # Resolve SST dataset path: prefer Vast.ai absolute path, fall back to relative
+    vast_path = "/workspace/jepa-coder-data/data/sst_dataset.jsonl"
+    local_path = "data/sst_dataset.jsonl"
+    dataset_path = vast_path if os.path.exists(vast_path) else local_path
+
+    from transformers import AutoTokenizer  # noqa: F401 — imported inside run_sst_training
+    _tokenizer_tmp = AutoTokenizer.from_pretrained("bigcode/starcoder2-3b", trust_remote_code=True)
+    vocab_size = _tokenizer_tmp.vocab_size
+
+    config = SSTConfig(
+        pretrained_checkpoint=args.pretrained_checkpoint,
+        output_dir=args.output_dir,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        max_examples=args.max_examples,
+        vocab_size=vocab_size,
+    )
+
+    run_sst_training(config, sst_data_iterator(dataset_path))

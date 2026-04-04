@@ -12,6 +12,7 @@ Per architecture spec Section 5.2:
     with code to establish geometric alignment in the embedding space.
 """
 
+import argparse
 import ast
 import json
 import os
@@ -22,7 +23,6 @@ from pathlib import Path
 from datasets import load_dataset
 
 
-OUTPUT_PATH = Path(__file__).parent / "extracted_solutions.jsonl"
 
 
 def try_parse(code: str) -> bool:
@@ -173,15 +173,18 @@ def extract_ocr() -> tuple[list[dict], dict]:
     return pairs, stats
 
 
-def main():
+def main(output_dir: str = "data/") -> None:
+    output_path = Path(output_dir) / "extracted_solutions.jsonl"
+
     apps_pairs, apps_stats = extract_apps()
     taco_pairs, taco_stats = extract_taco()
     ocr_pairs,  ocr_stats  = extract_ocr()
 
     all_pairs = apps_pairs + taco_pairs + ocr_pairs
 
-    print(f"\nWriting {len(all_pairs)} valid pairs to {OUTPUT_PATH} ...")
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\nWriting {len(all_pairs)} valid pairs to {output_path} ...")
+    with open(output_path, "w", encoding="utf-8") as f:
         for pair in all_pairs:
             f.write(json.dumps(pair, ensure_ascii=False) + "\n")
 
@@ -208,7 +211,7 @@ def main():
     print(f"  from APPS       : {len(apps_pairs):,}")
     print(f"  from TACO       : {len(taco_pairs):,}")
     print(f"  from OCR        : {len(ocr_pairs):,}")
-    print(f"Output file       : {OUTPUT_PATH}")
+    print(f"Output file       : {output_path}")
 
     if len(all_pairs) < 20_000:
         print("\nWARNING: fewer than 20K pairs — check dataset loading or filters.")
@@ -219,4 +222,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extract Python solution pairs from APPS, TACO, and OpenCodeReasoning.")
+    parser.add_argument("--output_dir", type=str, default="data/", help="Directory to write extracted_solutions.jsonl")
+    args = parser.parse_args()
+    main(output_dir=args.output_dir)
