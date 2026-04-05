@@ -57,9 +57,9 @@ def _tokenize(tok: AutoTokenizer, text: str) -> list[int]:
     return tok.encode(text, add_special_tokens=False)
 
 
-def _process_stream(tok: AutoTokenizer, limit: int | None, stats: Stats):
+def _process_stream(tok: AutoTokenizer, limit: int | None, stats: Stats, input_path: Path):
     """Generator: yield fully-processed example dicts one at a time."""
-    with open(INPUT_JSONL, encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8") as f:
         for raw_line in f:
             if limit is not None and stats.total_raw >= limit:
                 break
@@ -164,24 +164,25 @@ def _print_stats(stats: Stats) -> None:
     print("=" * 65)
 
 
-def main(limit: int | None = None) -> None:
+def main(limit: int | None = None, input_path: Path = INPUT_JSONL, output_jsonl: Path = OUTPUT_JSONL) -> None:
     tok   = _load_tokenizer()
     stats = Stats()
 
     # ── Stream directly to JSONL to avoid holding 1.7M rows in memory ────────
-    print(f"Processing {INPUT_JSONL} …")
-    OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_JSONL, "w", encoding="utf-8") as out_f:
-        for row in _process_stream(tok, limit, stats):
+    print(f"Processing {input_path} …")
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_jsonl, "w", encoding="utf-8") as out_f:
+        for row in _process_stream(tok, limit, stats, input_path):
             out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"Saved JSONL    → {OUTPUT_JSONL}  ({stats.accepted:,} examples)")
+    print(f"Saved JSONL    → {output_jsonl}  ({stats.accepted:,} examples)")
 
     # ── Build HF Dataset from the JSONL file (no full in-memory list) ────────
     print(f"Building HuggingFace Dataset from JSONL …")
-    ds = Dataset.from_json(str(OUTPUT_JSONL))
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ds.save_to_disk(str(OUTPUT_DIR))
-    print(f"Saved HF dataset → {OUTPUT_DIR}/")
+    output_dir = output_jsonl.with_suffix("")  # e.g. sst_dataset/ alongside sst_dataset.jsonl
+    ds = Dataset.from_json(str(output_jsonl))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ds.save_to_disk(str(output_dir))
+    print(f"Saved HF dataset → {output_dir}/")
 
     _print_stats(stats)
 
@@ -189,8 +190,16 @@ def main(limit: int | None = None) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--input", type=Path, default=INPUT_JSONL,
+        help="Path to extracted_solutions.jsonl produced by extract_python_solutions.py.",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=OUTPUT_JSONL,
+        help="Path for the output sst_dataset.jsonl file.",
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Process only the first N raw pairs (useful for a quick dry-run).",
     )
     args = parser.parse_args()
-    main(limit=args.limit)
+    main(limit=args.limit, input_path=args.input, output_jsonl=args.output)
