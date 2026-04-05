@@ -18,11 +18,10 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from datasets import load_dataset
-
-
 
 
 def try_parse(code: str) -> bool:
@@ -33,40 +32,156 @@ def try_parse(code: str) -> bool:
         return False
 
 
-def extract_apps() -> tuple[list[dict], dict]:
-    """Load codeparrot/apps (all splits), parse solutions JSON array."""
-    print("Loading codeparrot/apps ...")
+# ---------------------------------------------------------------------------
+# Per-example worker functions (top-level so they are picklable)
+# ---------------------------------------------------------------------------
+
+def _process_apps_example(example: dict) -> tuple[list[dict], dict]:
+    """Process one APPS example. Returns (pairs, stats)."""
     stats = {"total": 0, "passed": 0, "failed": 0}
     pairs = []
 
-    dataset = load_dataset("codeparrot/apps", trust_remote_code=True)
+    problem_text = example.get("question", "")
+    raw_solutions = example.get("solutions", "")
 
-    for split_name, split in dataset.items():
-        print(f"  Processing APPS split: {split_name} ({len(split)} examples)")
-        for example in split:
-            problem_text = example.get("question", "")
-            raw_solutions = example.get("solutions", "")
+    if not raw_solutions or not raw_solutions.strip():
+        return pairs, stats
 
-            if not raw_solutions or not raw_solutions.strip():
-                continue
+    try:
+        solutions = json.loads(raw_solutions)
+    except json.JSONDecodeError:
+        return pairs, stats
 
-            try:
-                solutions = json.loads(raw_solutions)
-            except json.JSONDecodeError:
-                continue
+    if not isinstance(solutions, list):
+        solutions = [solutions]
 
+    for code in solutions:
+        if not isinstance(code, str) or not code.strip():
+            continue
+        stats["total"] += 1
+        if try_parse(code):
+            stats["passed"] += 1
+            pairs.append({"problem": problem_text, "solution": code, "source": "apps"})
+        else:
+            stats["failed"] += 1
+
+    return pairs, stats
+
+
+def _process_taco_example(example: dict) -> tuple[list[dict], dict]:
+    """Process one TACO example. Returns (pairs, stats)."""
+    stats = {"total": 0, "passed": 0, "failed": 0}
+    pairs = []
+
+    problem_text = example.get("question", "")
+    raw_solutions = example.get("solutions", "")
+
+    if isinstance(raw_solutions, list):
+        solutions = raw_solutions
+    elif isinstance(raw_solutions, str) and raw_solutions.strip():
+        try:
+            solutions = json.loads(raw_solutions)
             if not isinstance(solutions, list):
                 solutions = [solutions]
+        except json.JSONDecodeError:
+            solutions = [raw_solutions]
+    else:
+        return pairs, stats
 
-            for code in solutions:
-                if not isinstance(code, str) or not code.strip():
-                    continue
-                stats["total"] += 1
-                if try_parse(code):
-                    stats["passed"] += 1
-                    pairs.append({"problem": problem_text, "solution": code, "source": "apps"})
-                else:
-                    stats["failed"] += 1
+    for code in solutions:
+        if not isinstance(code, str) or not code.strip():
+            continue
+        stats["total"] += 1
+        if try_parse(code):
+            stats["passed"] += 1
+            pairs.append({"problem": problem_text, "solution": code, "source": "taco"})
+        else:
+            stats["failed"] += 1
+
+    return pairs, stats
+
+
+# Module-level so they are compiled once per worker process, not per call
+_OCR_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_OCR_CODE_RE  = re.compile(r"```python\s*(.*?)```", re.DOTALL)
+
+
+def _process_ocr_example(example: dict) -> tuple[list[dict], dict]:
+    """Process one OCR example. Returns (pairs, stats)."""
+    stats = {"total": 0, "passed": 0, "failed": 0}
+    pairs = []
+
+    response = example.get("output") or example.get("response") or ""
+
+    think_match = _OCR_THINK_RE.search(response)
+    if not think_match:
+        return pairs, stats
+    reasoning_trace = think_match.group(1).strip()
+    if not reasoning_trace:
+        return pairs, stats
+
+    code = ""
+    dedicated = example.get("code") or example.get("python_code") or ""
+    if isinstance(dedicated, str) and dedicated.strip():
+        code = dedicated.strip()
+    else:
+        code_match = _OCR_CODE_RE.search(response)
+        if code_match:
+            code = code_match.group(1).strip()
+
+    if not code:
+        return pairs, stats
+
+    stats["total"] += 1
+    if try_parse(code):
+        stats["passed"] += 1
+        pairs.append({"problem": reasoning_trace, "solution": code, "source": "ocr"})
+    else:
+        stats["failed"] += 1
+
+    return pairs, stats
+
+
+# ---------------------------------------------------------------------------
+# Aggregation helper
+# ---------------------------------------------------------------------------
+
+def _aggregate(results) -> tuple[list[dict], dict]:
+    """Merge (pairs, stats) tuples from a pool map into one pair."""
+    all_pairs: list[dict] = []
+    stats = {"total": 0, "passed": 0, "failed": 0}
+    for result_pairs, result_stats in results:
+        all_pairs.extend(result_pairs)
+        stats["total"]  += result_stats["total"]
+        stats["passed"] += result_stats["passed"]
+        stats["failed"] += result_stats["failed"]
+    return all_pairs, stats
+
+
+# ---------------------------------------------------------------------------
+# Dataset extractors
+# ---------------------------------------------------------------------------
+
+def extract_apps() -> tuple[list[dict], dict]:
+    """Load codeparrot/apps (all splits), parse solutions JSON array."""
+    print("Loading codeparrot/apps ...")
+    pairs: list[dict] = []
+    stats = {"total": 0, "passed": 0, "failed": 0}
+
+    dataset = load_dataset("codeparrot/apps", trust_remote_code=True)
+    n_workers = os.cpu_count() or 1
+
+    for split_name, split in dataset.items():
+        examples = list(split)
+        print(f"  Processing APPS split: {split_name} ({len(examples)} examples) "
+              f"with {n_workers} workers")
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            split_pairs, split_stats = _aggregate(
+                pool.map(_process_apps_example, examples)
+            )
+        pairs.extend(split_pairs)
+        for k in stats:
+            stats[k] += split_stats[k]
 
     return pairs, stats
 
@@ -74,41 +189,23 @@ def extract_apps() -> tuple[list[dict], dict]:
 def extract_taco() -> tuple[list[dict], dict]:
     """Load BAAI/TACO (all splits), extract solutions."""
     print("Loading BAAI/TACO ...")
+    pairs: list[dict] = []
     stats = {"total": 0, "passed": 0, "failed": 0}
-    pairs = []
 
     dataset = load_dataset("BAAI/TACO", trust_remote_code=True)
+    n_workers = os.cpu_count() or 1
 
     for split_name, split in dataset.items():
-        print(f"  Processing TACO split: {split_name} ({len(split)} examples)")
-        for example in split:
-            problem_text = example.get("question", "")
-
-            # TACO solutions field: may be a list or a JSON-encoded string
-            raw_solutions = example.get("solutions", "")
-
-            if isinstance(raw_solutions, list):
-                solutions = raw_solutions
-            elif isinstance(raw_solutions, str) and raw_solutions.strip():
-                try:
-                    solutions = json.loads(raw_solutions)
-                    if not isinstance(solutions, list):
-                        solutions = [solutions]
-                except json.JSONDecodeError:
-                    # Treat the raw string as a single solution
-                    solutions = [raw_solutions]
-            else:
-                continue
-
-            for code in solutions:
-                if not isinstance(code, str) or not code.strip():
-                    continue
-                stats["total"] += 1
-                if try_parse(code):
-                    stats["passed"] += 1
-                    pairs.append({"problem": problem_text, "solution": code, "source": "taco"})
-                else:
-                    stats["failed"] += 1
+        examples = list(split)
+        print(f"  Processing TACO split: {split_name} ({len(examples)} examples) "
+              f"with {n_workers} workers")
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            split_pairs, split_stats = _aggregate(
+                pool.map(_process_taco_example, examples)
+            )
+        pairs.extend(split_pairs)
+        for k in stats:
+            stats[k] += split_stats[k]
 
     return pairs, stats
 
@@ -125,50 +222,19 @@ def extract_ocr() -> tuple[list[dict], dict]:
     interleaves reasoning with code, establishing geometric alignment.
     """
     print("Loading nvidia/OpenCodeReasoning ...")
-    stats = {"total": 0, "passed": 0, "failed": 0}
-    pairs = []
 
     dataset = load_dataset(
         "nvidia/OpenCodeReasoning",
         "split_0",
         split="split_0"
     )
-    print(f"  Processing OCR split: train ({len(dataset)} examples)")
+    examples = list(dataset)
+    n_workers = os.cpu_count() or 1
+    print(f"  Processing OCR split: train ({len(examples)} examples) "
+          f"with {n_workers} workers")
 
-    think_re = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-    code_re = re.compile(r"```python\s*(.*?)```", re.DOTALL)
-
-    for example in dataset:
-        response = example.get("output") or example.get("response") or ""
-
-        # ── Extract reasoning trace ──────────────────────────────────────────
-        think_match = think_re.search(response)
-        if not think_match:
-            continue
-        reasoning_trace = think_match.group(1).strip()
-        if not reasoning_trace:
-            continue
-
-        # ── Extract Python code ──────────────────────────────────────────────
-        # Prefer a dedicated clean 'code' column when available.
-        code = ""
-        dedicated = example.get("code") or example.get("python_code") or ""
-        if isinstance(dedicated, str) and dedicated.strip():
-            code = dedicated.strip()
-        else:
-            code_match = code_re.search(response)
-            if code_match:
-                code = code_match.group(1).strip()
-
-        if not code:
-            continue
-
-        stats["total"] += 1
-        if try_parse(code):
-            stats["passed"] += 1
-            pairs.append({"problem": reasoning_trace, "solution": code, "source": "ocr"})
-        else:
-            stats["failed"] += 1
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        pairs, stats = _aggregate(pool.map(_process_ocr_example, examples))
 
     return pairs, stats
 
