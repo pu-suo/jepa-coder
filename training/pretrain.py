@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import json
 import math
 import os
@@ -77,6 +78,7 @@ class PretrainConfig:
     # Checkpointing
     checkpoint_dir: str = "checkpoints/pretrain"
     checkpoint_every: int = 1000
+    save_total_limit: int = 2   # keep only the N most recent numbered ckpts
 
     # Logging — W&B only
     log_every: int = 10
@@ -115,29 +117,52 @@ def build_pretrain_data_iterator(
     eos_id: int = tokenizer.eos_token_id
     rng = random.Random(config.data_seed)
 
-    # Load all records into memory for shuffling; APPS+TACO+OCR is small enough
-    with open(jsonl_path, "r", encoding="utf-8") as fh:
-        records = [json.loads(line) for line in fh if line.strip()]
+    # Shuffle buffer: holds up to 10K tokenized records and yields them in
+    # random order. Much cheaper than shuffling the whole file.
+    SHUF_BUF = 10_000
 
-    buffer: list[int] = []
+    def _record_stream():
+        epoch = 0
+        while True:
+            with open(jsonl_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    yield json.loads(line)
+            epoch += 1
+            print(f"[data] completed epoch {epoch}, restarting stream")
+
+    records_iter = _record_stream()
+    shuffle_buf: list[dict] = []
+    token_buf: list[int] = []
 
     while True:
-        rng.shuffle(records)
-        for record in records:
-            problem = record.get("problem", record.get("question", ""))
-            solution = record.get("solution", record.get("code", ""))
+        # Refill shuffle buffer
+        while len(shuffle_buf) < SHUF_BUF:
+            try:
+                shuffle_buf.append(next(records_iter))
+            except StopIteration:
+                break
+        if not shuffle_buf:
+            return
+        rng.shuffle(shuffle_buf)
 
-            # Interleave: problem text then solution code, separated by EOS
+        # Drain half the buffer, tokenize, pack into context_length chunks
+        drain = shuffle_buf[: SHUF_BUF // 2]
+        shuffle_buf = shuffle_buf[SHUF_BUF // 2 :]
+
+        for record in drain:
+            problem  = record.get("problem", "")
+            solution = record.get("solution", "")
             for text in (problem, solution):
                 if not text:
                     continue
                 ids = tokenizer.encode(text, add_special_tokens=False)
                 ids.append(eos_id)
-                buffer.extend(ids)
-
-                while len(buffer) >= config.context_length:
-                    yield torch.tensor(buffer[:config.context_length], dtype=torch.long)
-                    buffer = buffer[config.context_length:]
+                token_buf.extend(ids)
+                while len(token_buf) >= config.context_length:
+                    yield torch.tensor(token_buf[: config.context_length], dtype=torch.long)
+                    token_buf = token_buf[config.context_length :]
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +199,7 @@ def save_checkpoint(
     total_tokens: int,
     reasoner: Reasoner,
     optimizer: torch.optim.Optimizer,
+    save_total_limit: int = 2,
     tag: str = "",
 ) -> None:
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -183,11 +209,22 @@ def save_checkpoint(
         "model_state_dict": reasoner.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
-    # Numbered checkpoint for milestone steps
     name = f"step_{step:07d}.pt" if not tag else f"{tag}.pt"
     torch.save(payload, os.path.join(ckpt_dir, name))
-    # "latest.pt" is always overwritten so resume can find the most recent state
     torch.save(payload, os.path.join(ckpt_dir, "latest.pt"))
+
+    # Rotation: keep only the most recent `save_total_limit` numbered ckpts.
+    # Tagged checkpoints (e.g. "pretrained_reasoner.pt") and "latest.pt" are
+    # never rotated — they're the artifacts you actually want to keep.
+    if not tag and save_total_limit > 0:
+        numbered = sorted(glob.glob(os.path.join(ckpt_dir, "step_*.pt")))
+        excess = len(numbered) - save_total_limit
+        for old in numbered[:max(0, excess)]:
+            try:
+                os.remove(old)
+                print(f"[ckpt] rotated out {os.path.basename(old)}")
+            except OSError:
+                pass
 
 
 def load_checkpoint(
@@ -337,16 +374,19 @@ def pretrain(config: PretrainConfig) -> None:
                 total_tokens,
                 reasoner,
                 optimizer,
+                save_total_limit=config.save_total_limit,
             )
 
     # ── Final save ──────────────────────────────────────────────────────────
-    # Numbered milestone + clean model file for the SST phase
+    # Numbered milestone + clean model file for the SST phase.
+    # save_total_limit=0 disables rotation so this final artifact is never deleted.
     save_checkpoint(
         config.checkpoint_dir,
         config.max_steps,
         total_tokens,
         reasoner,
         optimizer,
+        save_total_limit=0,
         tag="pretrained_reasoner",
     )
     pbar.close()
@@ -372,6 +412,8 @@ def _parse_args() -> PretrainConfig:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--wandb_project", default="jepa-coder-pretrain")
     parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--save_total_limit", type=int, default=2,
+                        help="Keep only the N most recent numbered checkpoints (0 = keep all)")
     args = parser.parse_args()
 
     return PretrainConfig(
@@ -383,6 +425,7 @@ def _parse_args() -> PretrainConfig:
         log_every=args.log_every,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        save_total_limit=args.save_total_limit,
     )
 
 
