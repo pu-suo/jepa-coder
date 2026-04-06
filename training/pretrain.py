@@ -99,12 +99,15 @@ def build_pretrain_data_iterator(
     tokenizer,
 ) -> Iterator[torch.Tensor]:
     """
-    Build a token-chunk iterator over APPS + TACO + OpenCodeReasoning data.
+    Window-level shuffle pool iterator over extracted_solutions.jsonl.
 
-    Reads from config.data_dir/extracted_solutions.jsonl (produced by data prep).
-    Interleaves problem text and solution code so the embeddings learn
-    angular alignment across English and Python.
+    Reads line-by-line (streaming), tokenizes, flat-packs into context_length
+    windows, and maintains a pool of POOL_SIZE=4096 windows.  On each yield,
+    picks a random slot, returns its window, and immediately refills that slot
+    from the stream.  This decorrelates consecutive yields without loading the
+    full dataset into RAM.
 
+    No truncation, no filtering, no upsampling weights.
     Yields LongTensor of shape (context_length,).
     """
     jsonl_path = os.path.join(config.data_dir, "extracted_solutions.jsonl")
@@ -116,53 +119,61 @@ def build_pretrain_data_iterator(
 
     eos_id: int = tokenizer.eos_token_id
     rng = random.Random(config.data_seed)
+    POOL_SIZE = 4096
 
-    # Shuffle buffer: holds up to 10K tokenized records and yields them in
-    # random order. Much cheaper than shuffling the whole file.
-    SHUF_BUF = 10_000
-
-    def _record_stream():
+    def _token_stream():
+        """Infinite stream of token IDs; re-opens file at each epoch boundary."""
         epoch = 0
         while True:
             with open(jsonl_path, "r", encoding="utf-8") as fh:
                 for line in fh:
-                    if not line.strip():
+                    line = line.strip()
+                    if not line:
                         continue
-                    yield json.loads(line)
+                    record = json.loads(line)
+                    problem = record.get("problem", "")
+                    solution = record.get("solution", "")
+                    for text in (problem, solution):
+                        if not text:
+                            continue
+                        ids = tokenizer.encode(text, add_special_tokens=False)
+                        ids.append(eos_id)
+                        yield from ids
             epoch += 1
             print(f"[data] completed epoch {epoch}, restarting stream")
 
-    records_iter = _record_stream()
-    shuffle_buf: list[dict] = []
-    token_buf: list[int] = []
+    def _window_stream(token_iter):
+        """Yields fully-packed lists of context_length token IDs."""
+        buf: list[int] = []
+        for tok_id in token_iter:
+            buf.append(tok_id)
+            if len(buf) >= config.context_length:
+                yield buf[: config.context_length]
+                buf = buf[config.context_length :]
 
+    win_iter = _window_stream(_token_stream())
+
+    # Cold start: fill pool before yielding anything
+    pool: list[list[int]] = []
+    for window in win_iter:
+        pool.append(window)
+        if len(pool) == POOL_SIZE:
+            break
+
+    if not pool:
+        return
+
+    # Steady state: O(1) random pick, O(1) refill
     while True:
-        # Refill shuffle buffer
-        while len(shuffle_buf) < SHUF_BUF:
-            try:
-                shuffle_buf.append(next(records_iter))
-            except StopIteration:
-                break
-        if not shuffle_buf:
-            return
-        rng.shuffle(shuffle_buf)
-
-        # Drain half the buffer, tokenize, pack into context_length chunks
-        drain = shuffle_buf[: SHUF_BUF // 2]
-        shuffle_buf = shuffle_buf[SHUF_BUF // 2 :]
-
-        for record in drain:
-            problem  = record.get("problem", "")
-            solution = record.get("solution", "")
-            for text in (problem, solution):
-                if not text:
-                    continue
-                ids = tokenizer.encode(text, add_special_tokens=False)
-                ids.append(eos_id)
-                token_buf.extend(ids)
-                while len(token_buf) >= config.context_length:
-                    yield torch.tensor(token_buf[: config.context_length], dtype=torch.long)
-                    token_buf = token_buf[config.context_length :]
+        idx = rng.randrange(len(pool))
+        yield torch.tensor(pool[idx], dtype=torch.long)
+        try:
+            pool[idx] = next(win_iter)
+        except StopIteration:
+            # _token_stream is infinite so this guard should never fire
+            pool.pop(idx)
+            if not pool:
+                return
 
 
 # ---------------------------------------------------------------------------
