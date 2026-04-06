@@ -1,6 +1,6 @@
 torch>=2.1.0
 transformers>=4.36.0
-datasets>=2.19.2
+datasets>=2.19.2,<4.0
 accelerate>=0.25.0
 tqdm>=4.65.0
 wandb>=0.16.0
