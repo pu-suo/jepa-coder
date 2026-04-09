@@ -41,7 +41,7 @@ def sst_train_step(
     problem_tokens: torch.Tensor,
     blocks: List[Dict[str, str]],
     tokenizer: Any,
-) -> Tuple[torch.Tensor, List[int]]:
+) -> Tuple[torch.Tensor, List[int], float, float]:
     """
     Process one training example and return (total_loss, stored_indices).
 
@@ -60,6 +60,8 @@ def sst_train_step(
     Returns:
         total_loss:     scalar tensor with gradients attached; caller calls .backward()
         stored_indices: list[int] of VQ codebook indices, one per block (including STOP)
+        sst_loss_sum:   float — sum of SST cosine losses across all blocks (no grad)
+        vq_loss_sum:    float — sum of VQ commitment losses across all blocks (no grad)
 
     What NOT to do (contract_1_sst_loop.md §4):
         - Do NOT feed quantized back into the loop — h = r (continuous), not quantized
@@ -88,6 +90,8 @@ def sst_train_step(
     # tensor with the correct grad_fn without creating an unnecessary leaf node.
     total_loss: torch.Tensor = torch.tensor(0.0, device=device)
     stored_indices: List[int] = []
+    sst_loss_sum: float = 0.0
+    vq_loss_sum: float = 0.0
 
     # ------------------------------------------------------------------
     # §3.2–§3.5 Reasoning loop — one iteration per block
@@ -121,11 +125,13 @@ def sst_train_step(
             vq.update_codebook_ema(r.detach(), idx)
 
         total_loss = total_loss + sst_loss + vq_loss
+        sst_loss_sum += sst_loss.item()
+        vq_loss_sum += vq_loss.item()
 
         # §3.5 Loop back the CONTINUOUS state, not quantized
         h = r                                    # (768,), ||h|| = 1
 
-    return total_loss, stored_indices
+    return total_loss, stored_indices, sst_loss_sum, vq_loss_sum
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +177,7 @@ class SSTConfig:
     # Checkpointing / logging
     checkpoint_every: int = 2000        # checkpoint every N examples
     log_every: int = 100                # wandb log every N examples
-    utilization_check_every: int = 1000 # VQ dead-entry check every N examples
+    utilization_check_every: int = 16000 # VQ dead-entry check every ~1000 optimizer steps (= 1000 * accumulation_steps)
 
     # Runtime
     device: str = 'cuda'
@@ -357,10 +363,11 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
     optimizer_step_count = 0
     optimizer.zero_grad()
 
-    # Accumulators for windowed logging
+    # Accumulators for windowed logging (reset every log_every examples)
     window_total_loss = 0.0
     window_sst_loss = 0.0
     window_vq_loss = 0.0
+
 
     for prob_ids, blocks in dataset:
         if example_count >= config.max_examples:
@@ -370,7 +377,7 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
         problem_tokens = torch.tensor(prob_ids[:config.max_seq_len], dtype=torch.long, device=device)
 
         # Forward pass — one example at a time (arch v2: no cross-example batching)
-        total_loss, stored_indices = sst_train_step(
+        total_loss, stored_indices, sst_val, vq_val = sst_train_step(
             reasoner=reasoner,
             ema_encoder=ema_encoder,
             vq=vq,
@@ -379,11 +386,9 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
             tokenizer=tokenizer,
         )
 
-        # Accumulate for logging — approximate SST/VQ split via VQ commitment cost
-        # The exact per-block breakdown is not tracked here to avoid overhead;
-        # total_loss is the authoritative metric.
-        total_val = total_loss.item()
-        window_total_loss += total_val
+        window_total_loss += total_loss.item()
+        window_sst_loss += sst_val
+        window_vq_loss += vq_val
 
         # Backprop (accumulate gradients across examples)
         total_loss.backward()
@@ -403,20 +408,15 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
             # Violation (updating before step) would create stale targets.
             ema_encoder.update(reasoner.embedding, decay=config.ema_decay)
 
-        # VQ utilization check — reset dead entries if utilization < 30%
-        # (arch v2 §2.2: reset unused entries to perturbed copies of used ones)
-        if example_count % config.utilization_check_every == 0:
-            util = vq.utilization()
-            if util < 0.30:
-                vq.reset_unused_entries()
-
-        # Wandb logging
+        # Wandb logging — before utilization check so util reflects pre-reset state
         if example_count % config.log_every == 0 and config.wandb_project:
-            avg_total = window_total_loss / config.log_every
+            n = config.log_every
             util = vq.utilization()
             wandb.log(
                 {
-                    'sst/total_loss': avg_total,
+                    'sst/total_loss': window_total_loss / n,
+                    'sst/sst_loss': window_sst_loss / n,
+                    'sst/vq_loss': window_vq_loss / n,
                     'sst/codebook_utilization': util,
                     'sst/lr': scheduler.get_last_lr()[0],
                     'sst/example_count': example_count,
@@ -425,6 +425,16 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
                 step=example_count,
             )
             window_total_loss = 0.0
+            window_sst_loss = 0.0
+            window_vq_loss = 0.0
+
+        # VQ utilization check — reset dead entries if utilization < 30%
+        # Fires every ~1000 optimizer steps (contract_2 §7.2: "every 1000 training steps")
+        # Must run AFTER logging so the chart shows pre-reset utilization.
+        if example_count % config.utilization_check_every == 0:
+            util = vq.utilization()
+            if util < 0.30:
+                vq.reset_unused_entries()
 
         # Checkpoint every N examples
         if example_count % config.checkpoint_every == 0:
