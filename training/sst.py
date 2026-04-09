@@ -178,6 +178,7 @@ class SSTConfig:
     checkpoint_every: int = 2000        # checkpoint every N examples
     log_every: int = 100                # wandb log every N examples
     utilization_check_every: int = 4000  # VQ dead-entry check every ~250 optimizer steps — more responsive rescue
+    reset_warmup_examples: int = 20000   # don't start VQ resets until latent space has differentiated
 
     # Runtime
     device: str = 'cuda'
@@ -428,10 +429,14 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
             window_sst_loss = 0.0
             window_vq_loss = 0.0
 
-        # VQ utilization check — reset dead entries if utilization < 30%
-        # Fires every ~1000 optimizer steps (contract_2 §7.2: "every 1000 training steps")
+        # VQ utilization check — reset dead entries if utilization < 30%.
+        # Guard: don't start until reset_warmup_examples have passed. In early
+        # SST training the Reasoner hasn't differentiated its latent space yet
+        # (outputs cluster to 1-2 regions), so resets create perpetual loops —
+        # all rescued entries are near the same 1-2 donors and die immediately.
         # Must run AFTER logging so the chart shows pre-reset utilization.
-        if example_count % config.utilization_check_every == 0:
+        if (example_count % config.utilization_check_every == 0 and
+                example_count >= config.reset_warmup_examples):
             util = vq.utilization()
             if util < 0.30:
                 vq.reset_unused_entries()
