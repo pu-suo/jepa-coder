@@ -31,6 +31,12 @@ class VectorQuantizer(nn.Module):
         self.register_buffer('usage_count', torch.zeros(codebook_size))
         self.register_buffer('total_count', torch.tensor(0))
 
+        # DDI buffer: ring buffer of recent unit-norm z values for data-dependent rescue
+        _DDI_BUFFER_SIZE = 4096
+        self.register_buffer('_z_buffer', torch.zeros(_DDI_BUFFER_SIZE, dim))
+        self.register_buffer('_buffer_ptr', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('_buffer_count', torch.zeros(1, dtype=torch.long))
+
         # Section 3: Initialization
         self.embedding.weight.data.uniform_(
             -1.0 / self.codebook_size,
@@ -97,6 +103,14 @@ class VectorQuantizer(nn.Module):
         self.usage_count[index] += 1
         self.total_count += 1
 
+        # ============================================
+        # STEP 7: Update DDI ring buffer
+        # ============================================
+        ptr = self._buffer_ptr.item()
+        self._z_buffer[ptr] = z.detach()
+        self._buffer_ptr[0] = (ptr + 1) % self._z_buffer.shape[0]
+        self._buffer_count[0] = min(self._buffer_count.item() + 1, self._z_buffer.shape[0])
+
         return quantized_st, index, loss
 
     # ------------------------------------------------------------------
@@ -138,42 +152,35 @@ class VectorQuantizer(nn.Module):
 
     def reset_unused_entries(self, threshold: int = 0):
         """
-        Replace unused codebook entries with perturbed copies of used entries.
-        Call periodically (every 1000 training steps) if utilization < 30%.
+        Data-Dependent Initialization (DDI) rescue.
+
+        Replaces the ENTIRE codebook with samples drawn from the ring buffer of
+        recent Reasoner outputs. Full replacement is necessary to break the
+        EMA-centroid monopoly: EMA-tuned active entries sit at cos~0.999 from
+        all current z values, while any rescued entry placed elsewhere scores
+        cos~0.0 and can never win the argmax. Replacing active entries too puts
+        all 512 entries on equal footing inside the actual data distribution.
+
+        Falls back to random unit vectors if the buffer is not yet populated.
 
         Args:
-            threshold: entries with usage_count <= threshold are considered unused
+            threshold: unused in DDI mode (kept for API compatibility)
         """
         with torch.no_grad():
-            unused_mask = self.usage_count <= threshold
-            used_mask = ~unused_mask
+            n_buffered = self._buffer_count.item()
 
-            if unused_mask.sum() == 0:
-                return  # All entries used
-
-            if used_mask.sum() == 0:
-                # Catastrophic collapse — reinitialize entire codebook
+            if n_buffered < self.codebook_size:
+                # Buffer not ready — random sphere probes as a temporary fallback
                 self.embedding.weight.data = F.normalize(
                     torch.randn_like(self.embedding.weight), dim=-1
                 )
-                self.usage_count.zero_()
-                self.total_count.zero_()
-                return
+            else:
+                # DDI: replace ALL codebook entries with buffer samples.
+                # z values stored in the buffer are already unit-norm (asserted
+                # in forward()), so no re-normalization is needed.
+                perm = torch.randperm(n_buffered, device=self.embedding.weight.device)
+                selected = self._z_buffer[perm[:self.codebook_size]]
+                self.embedding.weight.data = selected.clone()
 
-            used_indices = torch.where(used_mask)[0]
-            unused_indices = torch.where(unused_mask)[0]
-
-            for unused_idx in unused_indices:
-                # Random unit vector on the hypersphere.
-                # Rationale: when active entries are few and EMA-tuned to tight
-                # cluster centroids, any perturbation of those centroids still
-                # lands inside the centroid's Voronoi cell and never wins a
-                # nearest-neighbor competition. Random probes spread across the
-                # full sphere instead, acting as sensors for future Reasoner
-                # output directions as SST training diversifies the latent space.
-                rand_vec = torch.randn(self.dim, device=self.embedding.weight.device)
-                self.embedding.weight[unused_idx] = F.normalize(rand_vec, dim=-1)
-
-            # Reset counts after recovery
             self.usage_count.zero_()
             self.total_count.zero_()
