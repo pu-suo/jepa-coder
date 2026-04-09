@@ -177,8 +177,8 @@ class SSTConfig:
     # Checkpointing / logging
     checkpoint_every: int = 2000        # checkpoint every N examples
     log_every: int = 100                # wandb log every N examples
-    utilization_check_every: int = 4000  # VQ dead-entry check every ~250 optimizer steps — more responsive rescue
-    reset_warmup_examples: int = 20000   # don't start VQ resets until latent space has differentiated
+    utilization_check_every: int = 16000  # VQ dead-entry check every ~1000 optimizer steps
+    reset_warmup_examples: int = 50000   # don't start VQ resets until SST training has diversified the latent space
 
     # Runtime
     device: str = 'cuda'

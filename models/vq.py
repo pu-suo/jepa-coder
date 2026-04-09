@@ -163,20 +163,16 @@ class VectorQuantizer(nn.Module):
             used_indices = torch.where(used_mask)[0]
             unused_indices = torch.where(unused_mask)[0]
 
-            # Prefer the most-used entries as donors — they represent the most
-            # overloaded clusters and are the highest-value targets to split.
-            sorted_by_usage = used_indices[self.usage_count[used_indices].argsort(descending=True)]
-            top_k_donors = sorted_by_usage[:max(1, len(sorted_by_usage) // 3)]
-
             for unused_idx in unused_indices:
-                donor_idx = top_k_donors[torch.randint(len(top_k_donors), (1,))]
-                # σ=0.05 in d=768 gives E[cos θ]≈0.585 from donor — enough to escape
-                # the donor's Voronoi cell and compete for sub-cluster assignments.
-                self.embedding.weight[unused_idx] = F.normalize(
-                    self.embedding.weight[donor_idx] +
-                    torch.randn(self.dim, device=self.embedding.weight.device) * 0.05,
-                    dim=-1,
-                )
+                # Random unit vector on the hypersphere.
+                # Rationale: when active entries are few and EMA-tuned to tight
+                # cluster centroids, any perturbation of those centroids still
+                # lands inside the centroid's Voronoi cell and never wins a
+                # nearest-neighbor competition. Random probes spread across the
+                # full sphere instead, acting as sensors for future Reasoner
+                # output directions as SST training diversifies the latent space.
+                rand_vec = torch.randn(self.dim, device=self.embedding.weight.device)
+                self.embedding.weight[unused_idx] = F.normalize(rand_vec, dim=-1)
 
             # Reset counts after recovery
             self.usage_count.zero_()
