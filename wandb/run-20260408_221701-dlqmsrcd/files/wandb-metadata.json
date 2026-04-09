@@ -1,0 +1,25 @@
+{
+  "os": "macOS-26.0.1-arm64-arm-64bit",
+  "python": "CPython 3.12.9",
+  "startedAt": "2026-04-09T02:17:01.516767Z",
+  "args": [
+    "--pretrained_checkpoint",
+    "../jepa-coder-data/checkpoints/pretrain/pretrained_reasoner.pt",
+    "--output_dir",
+    "../jepa-coder-data/checkpoints/sst",
+    "--max_examples",
+    "100",
+    "--wandb_project",
+    "jepa-coder-sst-test"
+  ],
+  "program": "-m training.sst",
+  "git": {
+    "remote": "https://github.com/pu-suo/jepa-coder.git",
+    "commit": "e720e9936f47e56706a334abcaaf50b76e2202e4"
+  },
+  "email": "pusuo2026@gmail.com",
+  "root": "/Users/Tom/Documents/Active Projects/jepa-coder-project/jepa-coder",
+  "host": "MacBook-Pro-1015.local",
+  "executable": "/Users/Tom/miniforge3/bin/python",
+  "writerId": "xwqqws1sxcv2nlzzgj3674juhgl4hn6h"
+}

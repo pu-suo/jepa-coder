@@ -45,3 +45,4 @@ data/*.jsonl
 data/sst_dataset/
 
 .env
+wandb/

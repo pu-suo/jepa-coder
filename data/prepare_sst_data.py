@@ -114,7 +114,7 @@ def _worker_process_range(args: tuple[str, int, int, str]) -> dict:
             too_long = False
             for blk in blocks:
                 if blk["type"] == "STOP":
-                    enriched.append({"type": "STOP", "token_ids": []})
+                    enriched.append({"type": "STOP", "token_ids": tok.encode('<STOP>', add_special_tokens=False) or [tok.eos_token_id]})
                     continue
                 ids = tok.encode(blk["code"], add_special_tokens=False)
                 n = len(ids)

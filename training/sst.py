@@ -100,11 +100,8 @@ def sst_train_step(
         # r: (768,), ||r|| = 1
 
         # §3.3 Target generation — NO GRADIENTS (enforced inside encode_block)
-        block_tokens = tokenizer(
-            block['code'],
-            return_tensors='pt',
-            add_special_tokens=False,
-        ).input_ids.squeeze(0).to(device)
+        ids = block['token_ids'] if block.get('token_ids') else [tokenizer.eos_token_id]
+        block_tokens = torch.tensor(ids, dtype=torch.long, device=device)
         # block_tokens: (L_block,)
 
         t = ema_encoder.encode_block(block_tokens)
@@ -259,7 +256,12 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
     from transformers import AutoTokenizer
 
     torch.manual_seed(config.seed)
-    device = torch.device(config.device)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     os.makedirs(config.output_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -360,18 +362,12 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
     window_sst_loss = 0.0
     window_vq_loss = 0.0
 
-    for problem_text, blocks in dataset:
+    for prob_ids, blocks in dataset:
         if example_count >= config.max_examples:
             break
 
-        # Tokenize problem statement (truncated to max_seq_len)
-        problem_tokens = tokenizer(
-            problem_text,
-            return_tensors='pt',
-            add_special_tokens=True,
-            truncation=True,
-            max_length=config.max_seq_len,
-        ).input_ids.squeeze(0).to(device)
+        # Convert pre-tokenized IDs to tensor and truncate
+        problem_tokens = torch.tensor(prob_ids[:config.max_seq_len], dtype=torch.long, device=device)
 
         # Forward pass — one example at a time (arch v2: no cross-example batching)
         total_loss, stored_indices = sst_train_step(
@@ -454,15 +450,18 @@ def run_sst_training(config: SSTConfig, dataset: Iterator) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def sst_data_iterator(jsonl_path: str) -> Iterator[tuple[str, list[dict]]]:
-    """Yield (problem_text, blocks) from a JSONL file produced by prepare_sst_data.py."""
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            yield record["problem"], record["blocks"]
+def sst_data_iterator(dataset_path: str) -> Iterator[tuple[list[int], list[dict]]]:
+    """Yield (problem_token_ids, blocks) from the Arrow dataset."""
+    from datasets import load_from_disk, load_dataset
+
+    try:
+        ds = load_from_disk(dataset_path)
+    except FileNotFoundError:
+        print(f"Fallback: Loading raw Arrow files directly from {dataset_path}...")
+        ds = load_dataset("arrow", data_dir=dataset_path, split="train")
+
+    for row in ds:
+        yield row["problem_token_ids"], json.loads(row["blocks_json"])
 
 
 if __name__ == "__main__":
@@ -480,8 +479,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Resolve SST dataset path: prefer Vast.ai absolute path, fall back to relative
-    vast_path = "/workspace/jepa-coder-data/data/sst_dataset.jsonl"
-    local_path = "data/sst_dataset.jsonl"
+    vast_path = "/workspace/jepa-coder-data/data/sst_dataset"
+    local_path = "../jepa-coder-data/data/sst_dataset"
     dataset_path = vast_path if os.path.exists(vast_path) else local_path
 
     from transformers import AutoTokenizer  # noqa: F401 — imported inside run_sst_training

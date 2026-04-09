@@ -1,0 +1,45 @@
+{
+  "os": "macOS-26.0.1-arm64-arm-64bit",
+  "python": "CPython 3.12.9",
+  "startedAt": "2026-04-09T02:29:52.249356Z",
+  "args": [
+    "--pretrained_checkpoint",
+    "../jepa-coder-data/checkpoints/pretrain/pretrained_reasoner.pt",
+    "--output_dir",
+    "../jepa-coder-data/checkpoints/sst",
+    "--max_examples",
+    "100",
+    "--wandb_project",
+    "jepa-coder-sst-test"
+  ],
+  "program": "-m training.sst",
+  "git": {
+    "remote": "https://github.com/pu-suo/jepa-coder.git",
+    "commit": "e720e9936f47e56706a334abcaaf50b76e2202e4"
+  },
+  "email": "pusuo2026@gmail.com",
+  "root": "/Users/Tom/Documents/Active Projects/jepa-coder-project/jepa-coder",
+  "host": "MacBook-Pro-1015.local",
+  "executable": "/Users/Tom/miniforge3/bin/python",
+  "cpu_count": 14,
+  "cpu_count_logical": 14,
+  "disk": {
+    "/": {
+      "total": "494384795648",
+      "used": "467870199808"
+    }
+  },
+  "memory": {
+    "total": "25769803776"
+  },
+  "apple": {
+    "name": "Apple M4 Pro",
+    "ecpuCores": 4,
+    "pcpuCores": 10,
+    "gpuCores": 20,
+    "memoryGb": 24,
+    "swapTotalBytes": "18253611008",
+    "ramTotalBytes": "25769803776"
+  },
+  "writerId": "bs8pp0vm4lzf3bpuehx4dz5vlr6racjb"
+}
