@@ -163,13 +163,18 @@ class VectorQuantizer(nn.Module):
             used_indices = torch.where(used_mask)[0]
             unused_indices = torch.where(unused_mask)[0]
 
+            # Prefer the most-used entries as donors — they represent the most
+            # overloaded clusters and are the highest-value targets to split.
+            sorted_by_usage = used_indices[self.usage_count[used_indices].argsort(descending=True)]
+            top_k_donors = sorted_by_usage[:max(1, len(sorted_by_usage) // 3)]
+
             for unused_idx in unused_indices:
-                # Pick a random used entry as donor
-                donor_idx = used_indices[torch.randint(len(used_indices), (1,))]
-                # Copy with small random perturbation, then re-normalize
+                donor_idx = top_k_donors[torch.randint(len(top_k_donors), (1,))]
+                # σ=0.05 in d=768 gives E[cos θ]≈0.585 from donor — enough to escape
+                # the donor's Voronoi cell and compete for sub-cluster assignments.
                 self.embedding.weight[unused_idx] = F.normalize(
                     self.embedding.weight[donor_idx] +
-                    torch.randn(self.dim, device=self.embedding.weight.device) * 0.01,
+                    torch.randn(self.dim, device=self.embedding.weight.device) * 0.05,
                     dim=-1,
                 )
 
