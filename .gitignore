@@ -46,3 +46,4 @@ data/sst_dataset/
 
 .env
 wandb/
+checkpoints/
