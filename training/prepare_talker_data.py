@@ -39,14 +39,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 from collections import Counter
 from pathlib import Path
-from typing import Iterator, List
+from typing import Iterator, List, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 
 from models.reasoner import Reasoner
 from models.vq import VectorQuantizer
@@ -211,6 +213,64 @@ def sst_data_iterator(dataset_path: str) -> Iterator[tuple[list, list]]:
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker
+#
+# Model objects are stored as module-level globals so forked workers inherit
+# them via copy-on-write. Passing the model through pool.map args would pickle
+# it per chunk (~400 MB for the Reasoner) — which is what caused the hang.
+# ---------------------------------------------------------------------------
+
+_WORKER_REASONER: "Reasoner | None" = None
+_WORKER_VQ: "VectorQuantizer | None" = None
+_WORKER_MAX_SEQ_LEN: int = 0
+_WORKER_DEVICE: torch.device = torch.device("cpu")
+
+
+def _process_chunk(
+    chunk: List[Tuple[list, list]],
+) -> Tuple[List[dict], List[int], List[int], int]:
+    """Process a chunk of examples in a forked worker using module-level globals."""
+    reasoner = _WORKER_REASONER
+    vq = _WORKER_VQ
+    max_seq_len = _WORKER_MAX_SEQ_LEN
+    device = _WORKER_DEVICE
+
+    rows: List[dict] = []
+    plan_lengths: List[int] = []
+    all_indices: List[int] = []
+    n_skipped = 0
+
+    for prob_ids, blocks in chunk:
+        if not blocks or blocks[-1].get("type") != "STOP":
+            n_skipped += 1
+            continue
+        code_blocks = [b for b in blocks if b.get("type") == "CODE"]
+        if not code_blocks:
+            n_skipped += 1
+            continue
+
+        problem_tokens = torch.tensor(
+            prob_ids[:max_seq_len], dtype=torch.long, device=device,
+        )
+        plan_indices = collect_plan_indices(reasoner, vq, problem_tokens, blocks)
+
+        solution_token_ids: List[int] = []
+        for blk in code_blocks:
+            solution_token_ids.extend(blk["token_ids"])
+
+        plan_lengths.append(len(plan_indices))
+        all_indices.extend(plan_indices)
+        rows.append({
+            "problem_token_ids": list(prob_ids),
+            "plan_indices": plan_indices,
+            "solution_token_ids": solution_token_ids,
+            "n_plan_steps": len(plan_indices),
+        })
+
+    return rows, plan_lengths, all_indices, n_skipped
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 
@@ -286,16 +346,18 @@ def print_statistics(
 # ---------------------------------------------------------------------------
 
 def main(args: argparse.Namespace) -> None:
+    import time
     from datasets import Dataset, Features, Sequence, Value
     from transformers import AutoTokenizer
 
-    # ── Device ────────────────────────────────────────────────────────────
+    # ── Prevent OMP/MKL thread explosion across forked workers ────────────
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+
+    # ── Device (force CPU for multiprocessing — fork + MPS/CUDA is unsafe) ─
     if args.device:
         device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Device: {device}")
@@ -323,59 +385,86 @@ def main(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Iterate SST dataset and collect triples ───────────────────────────
+    # ── Materialize dataset ───────────────────────────────────────────────
+    print("Loading dataset into memory...")
+    all_examples = []
+    for i, (prob_ids, blocks) in enumerate(sst_data_iterator(args.dataset_path)):
+        if args.limit is not None and i >= args.limit:
+            break
+        all_examples.append((prob_ids, blocks))
+    print(f"Loaded {len(all_examples):,} examples")
+
+    # ── Resolve worker count ──────────────────────────────────────────────
+    n_workers = args.workers
+    if n_workers == 0:
+        n_workers = min(os.cpu_count() or 1, 10)
+    print(f"Workers: {n_workers}")
+
+    # ── Install models as module globals for worker fork inheritance ──────
+    global _WORKER_REASONER, _WORKER_VQ, _WORKER_MAX_SEQ_LEN, _WORKER_DEVICE
+    _WORKER_REASONER = reasoner
+    _WORKER_VQ = vq
+    _WORKER_MAX_SEQ_LEN = reasoner.max_seq_len
+    _WORKER_DEVICE = device
+
+    # ── Merge buffers ─────────────────────────────────────────────────────
     rows: List[dict] = []
     plan_lengths: List[int] = []
     all_indices: List[int] = []
     n_skipped = 0
 
-    for i, (prob_ids, blocks) in enumerate(sst_data_iterator(args.dataset_path)):
-        if args.limit is not None and i >= args.limit:
-            break
+    # ── Chunk the work ────────────────────────────────────────────────────
+    # Keep chunks small enough that we get periodic progress updates.
+    # Target: ~40 chunks per worker → frequent progress + low IPC overhead.
+    chunk_size = max(100, math.ceil(len(all_examples) / (n_workers * 40)))
+    chunks = [
+        all_examples[i : i + chunk_size]
+        for i in range(0, len(all_examples), chunk_size)
+    ]
+    print(f"Chunks: {len(chunks)} × {chunk_size} examples each")
 
-        # Validate block structure: must end with STOP and have ≥1 code block
-        if not blocks or blocks[-1].get("type") != "STOP":
-            n_skipped += 1
-            continue
+    t_start = time.time()
+    n_done = 0
 
-        code_blocks = [b for b in blocks if b.get("type") == "CODE"]
-        if not code_blocks:
-            n_skipped += 1
-            continue
-
-        problem_tokens = torch.tensor(
-            prob_ids[: reasoner.max_seq_len],
-            dtype=torch.long,
-            device=device,
-        )
-
-        plan_indices = collect_plan_indices(reasoner, vq, problem_tokens, blocks)
-
-        # Solution tokens: concatenate all CODE block token_ids in order.
-        # train_talker.py wraps these with BOS/EOS during batching.
-        solution_token_ids: List[int] = []
-        for blk in code_blocks:
-            solution_token_ids.extend(blk["token_ids"])
-
-        plan_lengths.append(len(plan_indices))
-        all_indices.extend(plan_indices)
-
-        rows.append(
-            {
-                "problem_token_ids": list(prob_ids),
-                "plan_indices": plan_indices,
-                "solution_token_ids": solution_token_ids,
-                "n_plan_steps": len(plan_indices),
-            }
-        )
-
-        if (i + 1) % 1000 == 0:
-            util = len(set(all_indices)) / vq.codebook_size * 100
+    # ── Process ───────────────────────────────────────────────────────────
+    if n_workers == 1:
+        # Sequential path (for debugging)
+        for chunk in chunks:
+            chunk_rows, chunk_pl, chunk_idx, chunk_skip = _process_chunk(chunk)
+            rows.extend(chunk_rows)
+            plan_lengths.extend(chunk_pl)
+            all_indices.extend(chunk_idx)
+            n_skipped += chunk_skip
+            n_done += len(chunk)
+            elapsed = time.time() - t_start
+            rate = n_done / elapsed if elapsed > 0 else 0
+            eta = (len(all_examples) - n_done) / rate if rate > 0 else 0
             print(
-                f"  {i + 1:>8,} examples  |  "
-                f"skipped={n_skipped}  |  "
-                f"codebook util={util:.1f}%"
+                f"  {n_done:>8,} / {len(all_examples):,}  "
+                f"({100*n_done/len(all_examples):.1f}%)  |  "
+                f"rate={rate:.1f}/s  eta={eta/60:.1f}m",
+                flush=True,
             )
+    else:
+        mp.set_start_method("fork", force=True)
+        with mp.Pool(n_workers) as pool:
+            for chunk_rows, chunk_pl, chunk_idx, chunk_skip in pool.imap_unordered(
+                _process_chunk, chunks
+            ):
+                rows.extend(chunk_rows)
+                plan_lengths.extend(chunk_pl)
+                all_indices.extend(chunk_idx)
+                n_skipped += chunk_skip
+                n_done += len(chunk_rows) + chunk_skip
+                elapsed = time.time() - t_start
+                rate = n_done / elapsed if elapsed > 0 else 0
+                eta = (len(all_examples) - n_done) / rate if rate > 0 else 0
+                print(
+                    f"  {n_done:>8,} / {len(all_examples):,}  "
+                    f"({100*n_done/len(all_examples):.1f}%)  |  "
+                    f"rate={rate:.1f}/s  eta={eta/60:.1f}m",
+                    flush=True,
+                )
 
     print(f"\nFinished: {len(rows):,} examples written, {n_skipped} skipped")
 
@@ -435,6 +524,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Dry-run: process only the first N SST examples",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of parallel workers (0 = auto, 1 = sequential for debugging)",
     )
 
     # Convenience: resolve standard paths automatically when not overridden
