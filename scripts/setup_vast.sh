@@ -78,7 +78,7 @@ echo "      Credentials loaded."
 # 4. Authenticate
 # ---------------------------------------------------------------------------
 echo "[4/8] Authenticating with Hugging Face and W&B..."
-python -m huggingface_hub.commands.cli login --token "$HF_TOKEN" --add-to-git-credential
+python -c "from huggingface_hub import login; login(token='$HF_TOKEN', add_to_git_credential=True)"
 echo "      HuggingFace auth OK."
 
 wandb login "$WANDB_API_KEY"
@@ -127,29 +127,29 @@ echo "[7/8] Downloading datasets and checkpoints from Hugging Face..."
 
 # --- Dataset -----------------------------------------------------------------
 echo "      Downloading dataset pusuo2026/jepa-coder-dataset ..."
-python -m huggingface_hub.commands.cli download \
-    pusuo2026/jepa-coder-dataset \
-    --repo-type dataset \
-    --local-dir /workspace/jepa-coder-data/data/ \
-    --local-dir-use-symlinks False
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('pusuo2026/jepa-coder-dataset', repo_type='dataset',
+                  local_dir='/workspace/jepa-coder-data/data/')
+"
 echo "      Dataset download complete."
 
 # --- Pretrain checkpoints ----------------------------------------------------
 echo "      Downloading pretrain checkpoints pusuo2026/jepa-coder-checkpoints ..."
-python -m huggingface_hub.commands.cli download \
-    pusuo2026/jepa-coder-checkpoints \
-    --repo-type model \
-    --local-dir /workspace/jepa-coder-data/checkpoints/pretrain/ \
-    --local-dir-use-symlinks False
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('pusuo2026/jepa-coder-checkpoints', repo_type='model',
+                  local_dir='/workspace/jepa-coder-data/checkpoints/pretrain/')
+"
 echo "      Pretrain checkpoint download complete."
 
 # --- SST checkpoints ---------------------------------------------------------
 echo "      Downloading SST checkpoints pusuo2026/jepa-coder-sst-checkpoint ..."
-python -m huggingface_hub.commands.cli download \
-    pusuo2026/jepa-coder-sst-checkpoint \
-    --repo-type model \
-    --local-dir /workspace/jepa-coder-data/checkpoints/sst/ \
-    --local-dir-use-symlinks False
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('pusuo2026/jepa-coder-sst-checkpoint', repo_type='model',
+                  local_dir='/workspace/jepa-coder-data/checkpoints/sst/')
+"
 echo "      SST checkpoint download complete."
 
 # ---------------------------------------------------------------------------
