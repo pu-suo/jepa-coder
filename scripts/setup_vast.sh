@@ -92,12 +92,14 @@ echo "[5/8] Creating directory structure..."
 mkdir -p /workspace/jepa-coder
 mkdir -p /workspace/jepa-coder-data/checkpoints/pretrain
 mkdir -p /workspace/jepa-coder-data/checkpoints/sst
+mkdir -p /workspace/jepa-coder-data/checkpoints/talker
 mkdir -p /workspace/jepa-coder-data/data/sst_dataset
 
 echo "      Directories created:"
 echo "        /workspace/jepa-coder"
 echo "        /workspace/jepa-coder-data/checkpoints/pretrain"
 echo "        /workspace/jepa-coder-data/checkpoints/sst"
+echo "        /workspace/jepa-coder-data/checkpoints/talker"
 echo "        /workspace/jepa-coder-data/data/sst_dataset"
 
 # ---------------------------------------------------------------------------
@@ -151,6 +153,15 @@ snapshot_download('pusuo2026/jepa-coder-sst-checkpoint', repo_type='model',
                   local_dir='/workspace/jepa-coder-data/checkpoints/sst/')
 "
 echo "      SST checkpoint download complete."
+
+# --- Talker checkpoints ------------------------------------------------------
+echo "      Downloading Talker checkpoints pusuo2026/jepa-coder-talker-checkpoint ..."
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('pusuo2026/jepa-coder-talker-checkpoint', repo_type='model',
+                  local_dir='/workspace/jepa-coder-data/checkpoints/talker/')
+"
+echo "      Talker checkpoint download complete."
 
 # ---------------------------------------------------------------------------
 # 8. Sanity checks
