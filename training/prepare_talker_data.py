@@ -355,9 +355,20 @@ def main(args: argparse.Namespace) -> None:
     os.environ["MKL_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
-    # ── Device (force CPU for multiprocessing — fork + MPS/CUDA is unsafe) ─
+    # ── Device ────────────────────────────────────────────────────────────
+    # CUDA auto-detected. With --workers > 1 we force CPU (fork + CUDA unsafe).
     if args.device:
         device = torch.device(args.device)
+    elif args.workers != 1 and args.workers != 0:
+        # Multiprocessing path: CPU only (fork + CUDA is unsafe)
+        device = torch.device("cpu")
+    elif args.workers == 0 and (os.cpu_count() or 1) > 1 and not torch.cuda.is_available():
+        # Auto mode on CPU-only machine → multiprocessing on CPU
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Device: {device}")
@@ -386,13 +397,15 @@ def main(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Materialize dataset ───────────────────────────────────────────────
-    print("Loading dataset into memory...")
+    print("Loading dataset into memory...", flush=True)
     all_examples = []
     for i, (prob_ids, blocks) in enumerate(sst_data_iterator(args.dataset_path)):
         if args.limit is not None and i >= args.limit:
             break
         all_examples.append((prob_ids, blocks))
-    print(f"Loaded {len(all_examples):,} examples")
+        if (i + 1) % 100000 == 0:
+            print(f"  materialized {i + 1:,} examples", flush=True)
+    print(f"Loaded {len(all_examples):,} examples", flush=True)
 
     # ── Resolve worker count ──────────────────────────────────────────────
     n_workers = args.workers
