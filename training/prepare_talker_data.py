@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import statistics
 import time
@@ -55,6 +56,13 @@ import torch.nn.functional as F
 
 from models.reasoner import Reasoner
 from models.vq import VectorQuantizer
+
+# Use orjson if available (2-3x faster than stdlib json for our payload)
+try:
+    import orjson
+    _json_loads = orjson.loads
+except ImportError:
+    _json_loads = json.loads
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +297,40 @@ def batched_vq_argmax(vq: VectorQuantizer, r: torch.Tensor) -> torch.Tensor:
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_examples(dataset_path: str, limit: int | None) -> List[dict]:
+def _parse_blocks_batch(batch: List[str]) -> List[dict | None]:
+    """
+    Worker: parse a batch of blocks_json strings. Returns one dict per input
+    (or None for invalid rows). Only returns fields derivable from blocks_json
+    — problem_token_ids is looked up separately to avoid IPC overhead.
+    """
+    out: List[dict | None] = []
+    for s in batch:
+        blocks = _json_loads(s)
+        if not blocks or blocks[-1].get("type") != "STOP":
+            out.append(None); continue
+        code_blocks = [b for b in blocks if b.get("type") == "CODE"]
+        if not code_blocks:
+            out.append(None); continue
+        solution: List[int] = []
+        for b in code_blocks:
+            solution.extend(b["token_ids"])
+        out.append({
+            "solution_token_ids": solution,
+            "plan_length": len(blocks) - 1,  # exclude STOP
+        })
+    return out
+
+
+def load_examples(
+    dataset_path: str,
+    limit: int | None,
+    n_workers: int = 0,
+) -> List[dict]:
     """
     Load and pre-filter the SST dataset into a list of example dicts.
 
-    Each dict has:
-        problem_token_ids: list[int]
-        solution_token_ids: list[int]  (concatenation of CODE block token_ids)
-        plan_length: int               (number of non-STOP blocks = steps to run)
+    Uses multiprocessing for JSON parsing (the bottleneck). Each worker gets
+    a batch of blocks_json strings and returns the extracted fields.
     """
     from datasets import load_from_disk, load_dataset
 
@@ -305,39 +339,56 @@ def load_examples(dataset_path: str, limit: int | None) -> List[dict]:
     except Exception:
         ds = load_dataset("arrow", data_dir=dataset_path, split="train")
 
+    if limit is not None:
+        ds = ds.select(range(min(limit, len(ds))))
+
+    N = len(ds)
+
+    # Extract the two columns as Python lists — one Arrow materialization
+    # instead of N per-row accesses. This alone is ~5-10x faster.
+    print("  extracting columns from Arrow...", flush=True)
+    t0 = time.time()
+    blocks_json_col = ds["blocks_json"]
+    problem_ids_col = ds["problem_token_ids"]
+    print(f"  extracted {N:,} rows in {time.time() - t0:.1f}s", flush=True)
+
+    if n_workers == 0:
+        n_workers = min(os.cpu_count() or 1, 16)
+    print(f"  parsing JSON with {n_workers} workers (orjson={_json_loads is not json.loads})", flush=True)
+
+    # Batch JSON strings into chunks for worker dispatch
+    batch_size = 2000
+    batches = [
+        blocks_json_col[i : i + batch_size]
+        for i in range(0, N, batch_size)
+    ]
+
     examples: List[dict] = []
     n_skipped = 0
     t0 = time.time()
+    processed = 0
 
-    for i, row in enumerate(ds):
-        if limit is not None and i >= limit:
-            break
-
-        blocks = json.loads(row["blocks_json"])
-        if not blocks or blocks[-1].get("type") != "STOP":
-            n_skipped += 1
-            continue
-        code_blocks = [b for b in blocks if b.get("type") == "CODE"]
-        if not code_blocks:
-            n_skipped += 1
-            continue
-
-        solution_token_ids: List[int] = []
-        for blk in code_blocks:
-            solution_token_ids.extend(blk["token_ids"])
-
-        examples.append({
-            "problem_token_ids": list(row["problem_token_ids"]),
-            "solution_token_ids": solution_token_ids,
-            "plan_length": len(blocks) - 1,  # exclude STOP
-        })
-
-        if (i + 1) % 200_000 == 0:
-            dt = time.time() - t0
-            print(
-                f"  loaded {i + 1:>9,}  ({(i + 1) / dt:.0f}/s)",
-                flush=True,
-            )
+    with mp.Pool(n_workers) as pool:
+        for batch_idx, batch_results in enumerate(
+            pool.imap(_parse_blocks_batch, batches, chunksize=1)
+        ):
+            base = batch_idx * batch_size
+            for j, parsed in enumerate(batch_results):
+                if parsed is None:
+                    n_skipped += 1
+                    continue
+                examples.append({
+                    "problem_token_ids": list(problem_ids_col[base + j]),
+                    "solution_token_ids": parsed["solution_token_ids"],
+                    "plan_length": parsed["plan_length"],
+                })
+            processed += len(batch_results)
+            if processed // 200_000 > (processed - len(batch_results)) // 200_000:
+                dt = time.time() - t0
+                print(
+                    f"  parsed {processed:>9,} / {N:,}  ({processed / dt:.0f}/s)",
+                    flush=True,
+                )
 
     print(
         f"  loaded {len(examples):,} valid examples "
