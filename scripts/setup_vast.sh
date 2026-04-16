@@ -29,12 +29,12 @@ apt-get install -y -qq git python3 python3-pip tmux htop nvtop
 echo "      System packages OK."
 
 # ---------------------------------------------------------------------------
-# 2. Python dependencies — huggingface_hub[cli] must be present before any
-#    hf operations below, so install it early.
+# 2. Python dependencies — huggingface_hub must be present (and upgraded)
+#    before any hf operations below, so install it early.
 # ---------------------------------------------------------------------------
 echo "[2/8] Installing Python base dependencies..."
 pip install --upgrade --quiet pip
-pip install --quiet "huggingface_hub[cli]" wandb
+pip install --quiet --upgrade huggingface_hub wandb
 echo "      Python base deps OK."
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ echo "      Credentials loaded."
 # 4. Authenticate
 # ---------------------------------------------------------------------------
 echo "[4/8] Authenticating with Hugging Face and W&B..."
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+python -m huggingface_hub.commands.cli login --token "$HF_TOKEN" --add-to-git-credential
 echo "      HuggingFace auth OK."
 
 wandb login "$WANDB_API_KEY"
@@ -127,7 +127,7 @@ echo "[7/8] Downloading datasets and checkpoints from Hugging Face..."
 
 # --- Dataset -----------------------------------------------------------------
 echo "      Downloading dataset pusuo2026/jepa-coder-dataset ..."
-huggingface-cli download \
+python -m huggingface_hub.commands.cli download \
     pusuo2026/jepa-coder-dataset \
     --repo-type dataset \
     --local-dir /workspace/jepa-coder-data/data/ \
@@ -136,7 +136,7 @@ echo "      Dataset download complete."
 
 # --- Pretrain checkpoints ----------------------------------------------------
 echo "      Downloading pretrain checkpoints pusuo2026/jepa-coder-checkpoints ..."
-huggingface-cli download \
+python -m huggingface_hub.commands.cli download \
     pusuo2026/jepa-coder-checkpoints \
     --repo-type model \
     --local-dir /workspace/jepa-coder-data/checkpoints/pretrain/ \
@@ -145,7 +145,7 @@ echo "      Pretrain checkpoint download complete."
 
 # --- SST checkpoints ---------------------------------------------------------
 echo "      Downloading SST checkpoints pusuo2026/jepa-coder-sst-checkpoint ..."
-huggingface-cli download \
+python -m huggingface_hub.commands.cli download \
     pusuo2026/jepa-coder-sst-checkpoint \
     --repo-type model \
     --local-dir /workspace/jepa-coder-data/checkpoints/sst/ \
