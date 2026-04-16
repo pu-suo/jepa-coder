@@ -532,21 +532,61 @@ def main(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Shard writer setup ────────────────────────────────────────────────
+    # Write rows to numbered parquet shards on disk as we go so a crash near
+    # the end doesn't lose hours of GPU work. At the end, concatenate into
+    # a single HF Arrow dataset.
+    features = Features({
+        "problem_token_ids": Sequence(Value("int32")),
+        "plan_indices": Sequence(Value("int32")),
+        "solution_token_ids": Sequence(Value("int32")),
+        "n_plan_steps": Value("int32"),
+    })
+    shard_dir = output_dir / "_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resume support: skip shards already on disk
+    existing_shards = sorted(shard_dir.glob("shard_*.parquet"))
+    shard_idx = len(existing_shards)
+    examples_already_done = 0
+    if existing_shards:
+        # Each shard's length = args.shard_size except possibly the last.
+        # To keep things simple, just assume full shards (we shard in fixed
+        # row counts from the top of the sorted examples list).
+        examples_already_done = shard_idx * args.shard_size
+        print(
+            f"Found {shard_idx} existing shard(s) → resuming from example "
+            f"{examples_already_done:,}",
+            flush=True,
+        )
+
+    def flush_shard(buffer: List[dict]) -> int:
+        nonlocal shard_idx
+        if not buffer:
+            return 0
+        path = shard_dir / f"shard_{shard_idx:05d}.parquet"
+        tmp = shard_dir / f".shard_{shard_idx:05d}.parquet.tmp"
+        ds_shard = Dataset.from_list(buffer, features=features)
+        ds_shard.to_parquet(str(tmp))
+        os.replace(tmp, path)  # atomic: either fully there or not at all
+        n = len(ds_shard)
+        shard_idx += 1
+        return n
+
     # ── Main loop ─────────────────────────────────────────────────────────
-    rows: List[dict] = []
+    row_buffer: List[dict] = []
     plan_lengths_all: List[int] = []
     all_indices_all: List[int] = []
 
     B = args.batch_size
     max_seq_len = reasoner.max_seq_len
     t_start = time.time()
-    n_done = 0
+    n_done = examples_already_done
 
-    for start in range(0, len(examples), B):
+    for start in range(examples_already_done, len(examples), B):
         batch = examples[start : start + B]
         bs = len(batch)
 
-        # Build problem-token tensors (truncated to max_seq_len)
         token_tensors = [
             torch.tensor(
                 e["problem_token_ids"][:max_seq_len],
@@ -563,30 +603,25 @@ def main(args: argparse.Namespace) -> None:
             device_type=device.type, dtype=autocast_dtype,
             enabled=(device.type == "cuda"),
         ):
-            h = batched_encode_problem(reasoner, token_tensors, device)  # (bs, d)
-
-            # Collect indices for up to max_plan steps
+            h = batched_encode_problem(reasoner, token_tensors, device)
             indices_per_step: List[torch.Tensor] = []
             for step_idx in range(max_plan):
-                r = batched_step(reasoner, h)           # (bs, d)
-                idx = batched_vq_argmax(vq, r)          # (bs,) long
+                r = batched_step(reasoner, h)
+                idx = batched_vq_argmax(vq, r)
                 indices_per_step.append(idx)
-                h = r                                   # continuous loopback
+                h = r
 
-        # Host transfer once per batch
         if indices_per_step:
-            # Stack as (max_plan, bs) then transpose to (bs, max_plan)
-            idx_matrix = torch.stack(indices_per_step, dim=0).t().cpu()  # (bs, max_plan)
+            idx_matrix = torch.stack(indices_per_step, dim=0).t().cpu()
         else:
             idx_matrix = torch.empty(bs, 0, dtype=torch.long)
 
         plan_lengths_cpu = plan_lengths.cpu().tolist()
 
-        # Write rows with per-example plan truncation
         for i, example in enumerate(batch):
             pl = plan_lengths_cpu[i]
             plan_indices = idx_matrix[i, :pl].tolist()
-            rows.append({
+            row_buffer.append({
                 "problem_token_ids": example["problem_token_ids"],
                 "plan_indices": plan_indices,
                 "solution_token_ids": example["solution_token_ids"],
@@ -597,9 +632,18 @@ def main(args: argparse.Namespace) -> None:
 
         n_done += bs
 
-        # Progress
+        # Flush a shard once the buffer hits shard_size
+        if len(row_buffer) >= args.shard_size:
+            n_flushed = flush_shard(row_buffer[: args.shard_size])
+            row_buffer = row_buffer[args.shard_size :]
+            print(
+                f"  ✓ flushed shard {shard_idx - 1} "
+                f"({n_flushed:,} rows) → {shard_dir}",
+                flush=True,
+            )
+
         elapsed = time.time() - t_start
-        rate = n_done / elapsed if elapsed > 0 else 0
+        rate = (n_done - examples_already_done) / elapsed if elapsed > 0 else 0
         eta_s = (len(examples) - n_done) / rate if rate > 0 else 0
         if (start // B) % 10 == 0 or n_done == len(examples):
             print(
@@ -609,20 +653,24 @@ def main(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-    print(f"\nFinished: {len(rows):,} examples written in {(time.time() - t_start)/60:.1f}m")
+    # Flush the remainder
+    if row_buffer:
+        flush_shard(row_buffer)
+        row_buffer = []
 
-    # ── Save Arrow dataset ────────────────────────────────────────────────
-    features = Features({
-        "problem_token_ids": Sequence(Value("int32")),
-        "plan_indices": Sequence(Value("int32")),
-        "solution_token_ids": Sequence(Value("int32")),
-        "n_plan_steps": Value("int32"),
-    })
-    ds = Dataset.from_list(rows, features=features)
+    print(f"\nFinished inference: {n_done:,} examples in {(time.time() - t_start)/60:.1f}m")
+    print(f"Shards written to: {shard_dir}")
+
+    # ── Concatenate shards into a single Arrow dataset ────────────────────
+    print("Concatenating shards into final Arrow dataset...", flush=True)
+    shard_paths = sorted(shard_dir.glob("shard_*.parquet"))
+    ds = Dataset.from_parquet([str(p) for p in shard_paths], features=features)
     ds.save_to_disk(str(output_dir))
     print(f"Saved talker dataset → {output_dir}  ({len(ds):,} rows)")
 
-    # ── Statistics ────────────────────────────────────────────────────────
+    # Keep shards until the user verifies the final dataset, then they can
+    # manually `rm -rf /workspace/jepa-coder-data/data/talker_dataset/_shards`
+
     print_statistics(plan_lengths_all, all_indices_all, vq.codebook_size)
 
 
@@ -640,5 +688,7 @@ if __name__ == "__main__":
                    help="Dry-run: process only the first N SST examples")
     p.add_argument("--batch_size", type=int, default=512,
                    help="Mega-batch size for encode_problem + step loop (default: 512)")
+    p.add_argument("--shard_size", type=int, default=100_000,
+                   help="Rows per on-disk parquet shard (default: 100,000)")
     args = p.parse_args()
     main(args)
