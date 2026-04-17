@@ -311,8 +311,15 @@ def _parse_blocks_batch(batch: List[str]) -> List[dict | None]:
         code_blocks = [b for b in blocks if b.get("type") == "CODE"]
         if not code_blocks:
             out.append(None); continue
+        # Concatenate block token_ids with a newline token between blocks.
+        # ast.unparse() (used by segment_ast.py) does NOT emit trailing
+        # newlines, so without this separator the Talker trains on
+        # "passif x:" instead of "pass\nif x:".
+        NEWLINE_TOKEN = 222  # StarCoder2 BPE token for '\n'
         solution: List[int] = []
         for b in code_blocks:
+            if solution:
+                solution.append(NEWLINE_TOKEN)
             solution.extend(b["token_ids"])
         out.append({
             "solution_token_ids": solution,
