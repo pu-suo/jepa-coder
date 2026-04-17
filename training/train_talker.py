@@ -89,6 +89,9 @@ class TalkerDataset(Dataset):
         }
 
 
+PLAN_PAD_ID = 512  # Must match Talker.plan_pad_id — avoids contaminating VQ index 0
+
+
 def collate_fn(batch: List[dict], pad_token_id: int = 0) -> dict:
     """
     Pad variable-length sequences to the longest in the batch.
@@ -116,7 +119,7 @@ def collate_fn(batch: List[dict], pad_token_id: int = 0) -> dict:
     target_ids = [item["target_code"] for item in batch]
 
     prob_padded, prob_mask = _pad(prob_ids, pad_token_id)
-    plan_padded, plan_mask = _pad(plan_ids, pad_token_id)
+    plan_padded, plan_mask = _pad(plan_ids, PLAN_PAD_ID)
     tgt_padded, tgt_mask = _pad(target_ids, pad_token_id)
 
     # src_key_padding_mask covers [problem; plan] concatenated

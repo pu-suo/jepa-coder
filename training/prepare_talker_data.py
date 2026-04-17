@@ -300,8 +300,9 @@ def batched_vq_argmax(vq: VectorQuantizer, r: torch.Tensor) -> torch.Tensor:
 def _parse_blocks_batch(batch: List[str]) -> List[dict | None]:
     """
     Worker: parse a batch of blocks_json strings. Returns one dict per input
-    (or None for invalid rows). Only returns fields derivable from blocks_json
-    — problem_token_ids is looked up separately to avoid IPC overhead.
+    (or None for invalid rows). Only returns the plan_length; solution_token_ids
+    now comes from the SST dataset's solution_token_ids column (the ORIGINAL
+    solution code, not block concatenation).
     """
     out: List[dict | None] = []
     for s in batch:
@@ -311,30 +312,92 @@ def _parse_blocks_batch(batch: List[str]) -> List[dict | None]:
         code_blocks = [b for b in blocks if b.get("type") == "CODE"]
         if not code_blocks:
             out.append(None); continue
-        # Concatenate block token_ids with a newline token between blocks.
-        # ast.unparse() (used by segment_ast.py) does NOT emit trailing
-        # newlines, so without this separator the Talker trains on
-        # "passif x:" instead of "pass\nif x:".
-        NEWLINE_TOKEN = 222  # StarCoder2 BPE token for '\n'
-        solution: List[int] = []
-        for b in code_blocks:
-            if solution:
-                solution.append(NEWLINE_TOKEN)
-            solution.extend(b["token_ids"])
         out.append({
-            "solution_token_ids": solution,
             "plan_length": len(blocks) - 1,  # exclude STOP
         })
     return out
 
 
+def _load_solution_lookup(
+    solutions_jsonl: str,
+    tokenizer_id: str = "bigcode/starcoder2-3b",
+) -> dict[tuple, List[List[int]]]:
+    """
+    Build a lookup from problem_token_ids → list of (n_blocks, solution_token_ids)
+    by reading the raw extracted_solutions.jsonl.
+
+    The same problem can appear multiple times (different solutions across
+    APPS/TACO/OCR sources). We store ALL solutions per problem, keyed on
+    problem tokens. At query time, the caller disambiguates by matching
+    n_blocks from the SST row against the segmented block count.
+
+    This avoids modifying the SST dataset.
+    """
+    from transformers import AutoTokenizer
+    from data.segment_ast import segment_solution_grouped
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
+    # Key: tuple of problem token IDs
+    # Value: list of (n_blocks, solution_token_ids) tuples
+    lookup: dict[tuple, List[Tuple[int, List[int]]]] = {}
+
+    print(f"  building solution lookup from {solutions_jsonl}...", flush=True)
+    t0 = time.time()
+    n_read = 0
+    n_segfail = 0
+    with open(solutions_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            entry = json.loads(line)
+            prob_ids = tuple(tok.encode(entry["problem"], add_special_tokens=False))
+            sol_text = entry["solution"]
+            sol_ids = tok.encode(sol_text, add_special_tokens=False)
+
+            # Segment to get n_blocks — must match what SST data prep produced
+            blocks = segment_solution_grouped(sol_text)
+            if blocks is None:
+                n_segfail += 1
+                n_read += 1
+                continue
+            n_code = sum(1 for b in blocks if b["type"] == "CODE")
+
+            lookup.setdefault(prob_ids, []).append((n_code, sol_ids))
+            n_read += 1
+
+    n_unique = len(lookup)
+    n_multi = sum(1 for v in lookup.values() if len(v) > 1)
+    print(
+        f"  read {n_read:,} entries → {n_unique:,} unique problems "
+        f"({n_multi:,} with multiple solutions, {n_segfail:,} seg failures) "
+        f"in {time.time() - t0:.1f}s",
+        flush=True,
+    )
+    return lookup
+
+
+def _match_solution(
+    candidates: List[Tuple[int, List[int]]],
+    n_blocks: int,
+) -> List[int] | None:
+    """Pick the candidate whose n_blocks matches the SST row's block count."""
+    for cand_n, cand_ids in candidates:
+        if cand_n == n_blocks:
+            return cand_ids
+    # No exact match — return None (caller skips this example)
+    return None
+
+
 def load_examples(
     dataset_path: str,
     limit: int | None,
+    solutions_jsonl: str | None = None,
     n_workers: int = 0,
 ) -> List[dict]:
     """
     Load and pre-filter the SST dataset into a list of example dicts.
+
+    If solutions_jsonl is provided, solution_token_ids are read from the
+    original extracted_solutions.jsonl (preserving correct indentation).
+    Otherwise falls back to concatenating block token_ids (legacy path).
 
     Uses multiprocessing for JSON parsing (the bottleneck). Each worker gets
     a batch of blocks_json strings and returns the extracted fields.
@@ -351,7 +414,12 @@ def load_examples(
 
     N = len(ds)
 
-    # Extract the two columns as Python lists — one Arrow materialization
+    # Build solution lookup from JSONL if provided
+    sol_lookup: dict[tuple, List[Tuple[int, List[int]]]] | None = None
+    if solutions_jsonl is not None:
+        sol_lookup = _load_solution_lookup(solutions_jsonl)
+
+    # Extract columns as Python lists — one Arrow materialization
     # instead of N per-row accesses. This alone is ~5-10x faster.
     print("  extracting columns from Arrow...", flush=True)
     t0 = time.time()
@@ -372,6 +440,7 @@ def load_examples(
 
     examples: List[dict] = []
     n_skipped = 0
+    n_no_solution = 0
     t0 = time.time()
     processed = 0
 
@@ -384,9 +453,31 @@ def load_examples(
                 if parsed is None:
                     n_skipped += 1
                     continue
+
+                prob_ids = list(problem_ids_col[base + j])
+
+                # Look up original solution from JSONL if available.
+                # Disambiguate duplicates by matching n_blocks.
+                if sol_lookup is not None:
+                    candidates = sol_lookup.get(tuple(prob_ids))
+                    if candidates is None:
+                        n_no_solution += 1
+                        continue
+                    sol_ids = _match_solution(candidates, parsed["plan_length"])
+                    if sol_ids is None:
+                        n_no_solution += 1
+                        continue
+                else:
+                    # Legacy fallback: concatenate block tokens (lossy)
+                    blocks = _json_loads(blocks_json_col[base + j])
+                    code_blocks = [b for b in blocks if b.get("type") == "CODE"]
+                    sol_ids = []
+                    for b in code_blocks:
+                        sol_ids.extend(b["token_ids"])
+
                 examples.append({
-                    "problem_token_ids": list(problem_ids_col[base + j]),
-                    "solution_token_ids": parsed["solution_token_ids"],
+                    "problem_token_ids": prob_ids,
+                    "solution_token_ids": sol_ids,
                     "plan_length": parsed["plan_length"],
                 })
             processed += len(batch_results)
@@ -397,9 +488,12 @@ def load_examples(
                     flush=True,
                 )
 
+    skip_msg = f"{n_skipped:,} skipped"
+    if n_no_solution:
+        skip_msg += f", {n_no_solution:,} missing solution"
     print(
         f"  loaded {len(examples):,} valid examples "
-        f"({n_skipped:,} skipped) in {time.time() - t0:.1f}s",
+        f"({skip_msg}) in {time.time() - t0:.1f}s",
         flush=True,
     )
     return examples
@@ -523,7 +617,10 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Load dataset ──────────────────────────────────────────────────────
     print("Loading dataset...")
-    examples = load_examples(args.dataset_path, args.limit)
+    examples = load_examples(
+        args.dataset_path, args.limit,
+        solutions_jsonl=args.solutions_jsonl,
+    )
     if not examples:
         print("No examples to process.")
         return
@@ -688,6 +785,10 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint_dir", type=str, required=True)
     p.add_argument("--checkpoint_tag", type=str, default="final")
     p.add_argument("--dataset_path", type=str, required=True)
+    p.add_argument("--solutions_jsonl", type=str, default=None,
+                   help="Path to extracted_solutions.jsonl for original solution text. "
+                        "If provided, Talker targets use the original code (with correct "
+                        "indentation) instead of concatenating segmented blocks.")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--device", type=str, default="",
                    help="Device override: cuda / cpu / mps (auto-detected)")

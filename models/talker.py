@@ -58,9 +58,12 @@ class Talker(nn.Module):
         # Separate embedding for problem text tokens
         self.text_embedding = nn.Embedding(vocab_size, dim)
 
-        # Separate embedding for plan indices — NOT the VQ codebook
-        # The Talker learns its own representation of each codebook index
-        self.plan_embedding = nn.Embedding(512, dim)
+        # Separate embedding for plan indices — NOT the VQ codebook.
+        # The Talker learns its own representation of each codebook index.
+        # 513 entries: indices 0-511 for codebook, index 512 reserved for
+        # padding (so pad doesn't contaminate codebook index 0 = VQ STOP).
+        self.plan_pad_id = 512
+        self.plan_embedding = nn.Embedding(513, dim, padding_idx=512)
 
         # Segment embeddings: 0 = problem, 1 = plan
         self.segment_embedding = nn.Embedding(2, dim)
