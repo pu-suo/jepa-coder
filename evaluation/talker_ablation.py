@@ -77,6 +77,9 @@ def try_ast_parse(code: str) -> bool:
         return False
 
 
+MAX_PROB_LEN = 512  # Must match training (train_talker.py max_prob_len)
+
+
 def generate_code(
     talker: Talker,
     tokenizer,
@@ -86,7 +89,10 @@ def generate_code(
     max_length: int = 1024,
 ) -> str:
     """Run Talker generation and decode to string."""
-    problem_ids = problem_ids.to(device)
+    # Truncate problem tokens to match training limit — the Talker's
+    # position_embedding has max_seq_len=1024 entries and must cover
+    # L_prob + M positions in the encoder.
+    problem_ids = problem_ids[:MAX_PROB_LEN].to(device)
     plan_indices = plan_indices.to(device)
     token_ids = talker.generate(problem_ids, plan_indices, max_length=max_length)
     return tokenizer.decode(token_ids, skip_special_tokens=True)

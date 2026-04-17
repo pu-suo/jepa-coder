@@ -94,6 +94,7 @@ mkdir -p /workspace/jepa-coder-data/checkpoints/pretrain
 mkdir -p /workspace/jepa-coder-data/checkpoints/sst
 mkdir -p /workspace/jepa-coder-data/checkpoints/talker
 mkdir -p /workspace/jepa-coder-data/data/sst_dataset
+mkdir -p /workspace/jepa-coder-data/data/talker_dataset
 
 echo "      Directories created:"
 echo "        /workspace/jepa-coder"
@@ -101,6 +102,7 @@ echo "        /workspace/jepa-coder-data/checkpoints/pretrain"
 echo "        /workspace/jepa-coder-data/checkpoints/sst"
 echo "        /workspace/jepa-coder-data/checkpoints/talker"
 echo "        /workspace/jepa-coder-data/data/sst_dataset"
+echo "        /workspace/jepa-coder-data/data/talker_dataset"
 
 # ---------------------------------------------------------------------------
 # 6. Clone / update codebase
@@ -162,6 +164,15 @@ snapshot_download('pusuo2026/jepa-coder-talker-checkpoint', repo_type='model',
                   local_dir='/workspace/jepa-coder-data/checkpoints/talker/')
 "
 echo "      Talker checkpoint download complete."
+
+# --- Talker dataset ----------------------------------------------------------
+echo "      Downloading Talker dataset pusuo2026/jepa-coder-talker-dataset ..."
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('pusuo2026/jepa-coder-talker-dataset', repo_type='dataset',
+                  local_dir='/workspace/jepa-coder-data/data/talker_dataset/')
+" || echo "      WARNING: Talker dataset not found on HF. Run prepare_talker_data.py to generate it."
+echo "      Talker dataset step complete."
 
 # ---------------------------------------------------------------------------
 # 8. Sanity checks

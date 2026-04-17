@@ -49,6 +49,7 @@ from training.prepare_talker_data import load_frozen_models
 # ---------------------------------------------------------------------------
 
 STOP_INDEX = 0
+MAX_PROB_LEN = 512  # Must match training (train_talker.py max_prob_len)
 
 
 @torch.no_grad()
@@ -120,9 +121,12 @@ def generate_solution(
 
     # ------------------------------------------------------------------
     # Stage 3: Talker generation
+    #   Truncate problem tokens to Talker's training limit — the Talker's
+    #   position_embedding (max_seq_len=1024) must cover L_prob + M positions.
     # ------------------------------------------------------------------
+    talker_prob_tokens = prob_tokens[:MAX_PROB_LEN]
     plan_tensor = torch.tensor(plan_indices, dtype=torch.long, device=device)
-    generated_ids = talker.generate(prob_tokens, plan_tensor, max_length=max_code_length)
+    generated_ids = talker.generate(talker_prob_tokens, plan_tensor, max_length=max_code_length)
     code = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     return code, plan_indices, n_steps
