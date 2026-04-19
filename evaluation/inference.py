@@ -41,7 +41,7 @@ from transformers import AutoTokenizer
 from models.reasoner import Reasoner
 from models.talker import Talker
 from models.vq import VectorQuantizer
-from training.prepare_talker_data import load_frozen_models
+from data.prepare_talker_data import load_frozen_models
 
 
 # ---------------------------------------------------------------------------

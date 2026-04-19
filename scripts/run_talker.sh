@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # JEPA-Coder: Phase 3 — Talker Training
 # Trains the Talker on pre-generated (problem, plan, code) triples.
-# Prerequisites: run prepare_talker_data.py first (Phase 3 data prep).
+# Prerequisites: run scripts/run_prepare_talker_data.sh first (Phase 3 data prep).
 # Usage: tmux new -s talker && bash scripts/run_talker.sh
 # Monitor: W&B dashboard (jepa-coder-talker project)
 
@@ -15,12 +15,7 @@ TALKER_DATA="/workspace/jepa-coder-data/data/talker_dataset"
 
 if [ ! -d "$TALKER_DATA" ]; then
     echo "ERROR: Talker dataset not found at $TALKER_DATA"
-    echo "Run prepare_talker_data.py first:"
-    echo "  python -m training.prepare_talker_data \\"
-    echo "      --checkpoint_dir /workspace/jepa-coder-data/checkpoints/sst \\"
-    echo "      --checkpoint_tag final \\"
-    echo "      --dataset_path  /workspace/jepa-coder-data/data/sst_dataset \\"
-    echo "      --output_dir    $TALKER_DATA"
+    echo "Run: bash scripts/run_prepare_talker_data.sh"
     exit 1
 fi
 

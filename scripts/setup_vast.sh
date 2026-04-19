@@ -21,6 +21,34 @@ echo "=========================================="
 echo ""
 
 # ---------------------------------------------------------------------------
+# Helper: download from HF with graceful handling when repo doesn't exist
+# ---------------------------------------------------------------------------
+hf_download() {
+    local repo_id="$1"
+    local repo_type="$2"
+    local local_dir="$3"
+    local allow_patterns="${4:-}"  # optional: comma-separated glob patterns
+
+    local filter_arg=""
+    if [ -n "$allow_patterns" ]; then
+        filter_arg="allow_patterns=[$(echo "$allow_patterns" | sed "s/[^,]*/'&'/g")],"
+    fi
+
+    echo "      Downloading $repo_id ($repo_type) ..."
+    if python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('$repo_id', repo_type='$repo_type',
+                  ${filter_arg}
+                  local_dir='$local_dir')
+" 2>/dev/null; then
+        echo "      ✓ $repo_id download complete."
+    else
+        echo "      ⚠ $repo_id not found on HuggingFace — skipping."
+        echo "        (This is OK if you haven't uploaded it yet.)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 1. System dependencies
 # ---------------------------------------------------------------------------
 echo "[1/8] Installing system dependencies..."
@@ -96,13 +124,7 @@ mkdir -p /workspace/jepa-coder-data/checkpoints/talker
 mkdir -p /workspace/jepa-coder-data/data/sst_dataset
 mkdir -p /workspace/jepa-coder-data/data/talker_dataset
 
-echo "      Directories created:"
-echo "        /workspace/jepa-coder"
-echo "        /workspace/jepa-coder-data/checkpoints/pretrain"
-echo "        /workspace/jepa-coder-data/checkpoints/sst"
-echo "        /workspace/jepa-coder-data/checkpoints/talker"
-echo "        /workspace/jepa-coder-data/data/sst_dataset"
-echo "        /workspace/jepa-coder-data/data/talker_dataset"
+echo "      Directories created."
 
 # ---------------------------------------------------------------------------
 # 6. Clone / update codebase
@@ -126,53 +148,33 @@ echo "      Project requirements OK."
 
 # ---------------------------------------------------------------------------
 # 7. Hugging Face data pulls
+#    Only downloads *_final.pt checkpoints — intermediate step checkpoints
+#    are for crash recovery during training and not needed on a fresh instance.
 # ---------------------------------------------------------------------------
 echo "[7/8] Downloading datasets and checkpoints from Hugging Face..."
 
-# --- Dataset -----------------------------------------------------------------
-echo "      Downloading dataset pusuo2026/jepa-coder-dataset ..."
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('pusuo2026/jepa-coder-dataset', repo_type='dataset',
-                  local_dir='/workspace/jepa-coder-data/data/')
-"
-echo "      Dataset download complete."
+# --- SST dataset (problem/solution pairs) ---
+hf_download "pusuo2026/jepa-coder-dataset" "dataset" \
+    "/workspace/jepa-coder-data/data/"
 
-# --- Pretrain checkpoints ----------------------------------------------------
-echo "      Downloading pretrain checkpoints pusuo2026/jepa-coder-checkpoints ..."
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('pusuo2026/jepa-coder-checkpoints', repo_type='model',
-                  local_dir='/workspace/jepa-coder-data/checkpoints/pretrain/')
-"
-echo "      Pretrain checkpoint download complete."
+# --- Pretrain checkpoints (final only) ---
+hf_download "pusuo2026/jepa-coder-checkpoints" "model" \
+    "/workspace/jepa-coder-data/checkpoints/pretrain/" \
+    "*final*"
 
-# --- SST checkpoints ---------------------------------------------------------
-echo "      Downloading SST checkpoints pusuo2026/jepa-coder-sst-checkpoint ..."
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('pusuo2026/jepa-coder-sst-checkpoint', repo_type='model',
-                  local_dir='/workspace/jepa-coder-data/checkpoints/sst/')
-"
-echo "      SST checkpoint download complete."
+# --- SST checkpoints (final only) ---
+hf_download "pusuo2026/jepa-coder-sst-checkpoint" "model" \
+    "/workspace/jepa-coder-data/checkpoints/sst/" \
+    "*final*"
 
-# --- Talker checkpoints ------------------------------------------------------
-echo "      Downloading Talker checkpoints pusuo2026/jepa-coder-talker-checkpoint ..."
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('pusuo2026/jepa-coder-talker-checkpoint', repo_type='model',
-                  local_dir='/workspace/jepa-coder-data/checkpoints/talker/')
-"
-echo "      Talker checkpoint download complete."
+# --- Talker checkpoints (final only) ---
+hf_download "pusuo2026/jepa-coder-talker-checkpoint" "model" \
+    "/workspace/jepa-coder-data/checkpoints/talker/" \
+    "*final*"
 
-# --- Talker dataset ----------------------------------------------------------
-echo "      Downloading Talker dataset pusuo2026/jepa-coder-talker-dataset ..."
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('pusuo2026/jepa-coder-talker-dataset', repo_type='dataset',
-                  local_dir='/workspace/jepa-coder-data/data/talker_dataset/')
-" || echo "      WARNING: Talker dataset not found on HF. Run prepare_talker_data.py to generate it."
-echo "      Talker dataset step complete."
+# --- Talker dataset ---
+hf_download "pusuo2026/jepa-coder-talker-dataset" "dataset" \
+    "/workspace/jepa-coder-data/data/talker_dataset/"
 
 # ---------------------------------------------------------------------------
 # 8. Sanity checks

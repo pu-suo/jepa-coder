@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JEPA-Coder: Data preparation pipeline (rewritten)
+# JEPA-Coder: SST data preparation pipeline
 #
 # Peak disk usage with the new pipeline:
 #   Step 1 (extract):  ~90 GB HF cache + 21 GB JSONL     = ~111 GB peak

@@ -4,7 +4,7 @@ training/train_talker.py — Phase 3: Talker Training.
 Specification: docs/contract_3_talker_interface.md §4
 
 Trains the Talker encoder-decoder on pre-generated (problem, plan, code)
-triples produced by training/prepare_talker_data.py.
+triples produced by data/prepare_talker_data.py.
 
 Critical invariants (contract_3 §4, §7):
   - Reasoner and VQ are COMPLETELY FROZEN — no parameters loaded, no gradients
@@ -40,7 +40,7 @@ from models.talker import Talker
 
 class TalkerDataset(Dataset):
     """
-    Wraps the Arrow dataset produced by prepare_talker_data.py.
+    Wraps the Arrow dataset produced by data/prepare_talker_data.py.
 
     Each row contains:
         problem_token_ids:  list[int]  — tokenized problem text
@@ -510,7 +510,7 @@ if __name__ == "__main__":
     # Paths
     parser.add_argument(
         "--dataset_path", type=str, required=True,
-        help="Path to talker Arrow dataset (output of prepare_talker_data.py)",
+        help="Path to talker Arrow dataset (output of data/prepare_talker_data.py)",
     )
     parser.add_argument(
         "--output_dir", type=str, default="checkpoints/talker",

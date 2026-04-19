@@ -1,5 +1,5 @@
 """
-training/prepare_talker_data.py — Phase 3 data preparation.
+data/prepare_talker_data.py — Phase 3 data preparation.
 
 H100-optimized batched version. Runs the frozen Reasoner + VQ over the SST
 dataset and writes (problem_token_ids, plan_indices, solution_token_ids)
@@ -23,7 +23,7 @@ Key correctness decisions (identical to sequential version):
   - Output Arrow schema matches the sequential version exactly
 
 Usage (Vast.ai H100):
-    python -m training.prepare_talker_data \\
+    python -m data.prepare_talker_data \\
         --checkpoint_dir /workspace/jepa-coder-data/checkpoints/sst \\
         --checkpoint_tag final \\
         --dataset_path   /workspace/jepa-coder-data/data/sst_dataset \\
@@ -31,7 +31,7 @@ Usage (Vast.ai H100):
         --batch_size     512
 
 Usage (local dry-run, small limit):
-    python -m training.prepare_talker_data \\
+    python -m data.prepare_talker_data \\
         --checkpoint_dir ../jepa-coder-data/checkpoints/sst \\
         --checkpoint_tag final \\
         --dataset_path   ../jepa-coder-data/data/sst_dataset \\
