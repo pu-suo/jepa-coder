@@ -35,16 +35,28 @@ hf_download() {
     fi
 
     echo "      Downloading $repo_id ($repo_type) ..."
+
+    # Check if repo exists before attempting download — avoids hangs
+    if ! python -c "
+from huggingface_hub import repo_exists
+if not repo_exists('$repo_id', repo_type='$repo_type'):
+    raise SystemExit(1)
+" 2>/dev/null; then
+        echo "      ⚠ $repo_id not found on HuggingFace — skipping."
+        echo "        (This is OK if you haven't uploaded it yet.)"
+        return 0
+    fi
+
+    # Repo exists — download it (show progress on stderr)
     if python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('$repo_id', repo_type='$repo_type',
                   ${filter_arg}
                   local_dir='$local_dir')
-" 2>/dev/null; then
+"; then
         echo "      ✓ $repo_id download complete."
     else
-        echo "      ⚠ $repo_id not found on HuggingFace — skipping."
-        echo "        (This is OK if you haven't uploaded it yet.)"
+        echo "      ⚠ $repo_id download failed — skipping."
     fi
 }
 
