@@ -318,10 +318,50 @@ def _parse_blocks_batch(batch: List[str]) -> List[dict | None]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Solution lookup — multiprocessed for speed
+# ---------------------------------------------------------------------------
+
+_LOOKUP_TOK = None  # set once per worker by pool initializer
+
+
+def _lookup_worker_init(tokenizer_id: str) -> None:
+    global _LOOKUP_TOK
+    from transformers import AutoTokenizer
+    _LOOKUP_TOK = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
+
+
+def _lookup_process_batch(lines: List[str]) -> List[dict | None]:
+    """Worker: tokenize + segment a batch of JSONL lines."""
+    from data.segment_ast import segment_solution_grouped
+
+    tok = _LOOKUP_TOK
+    results = []
+    for line in lines:
+        entry = _json_loads(line)
+        prob_ids = tok.encode(entry["problem"], add_special_tokens=False)
+        sol_text = entry["solution"]
+
+        blocks = segment_solution_grouped(sol_text)
+        if blocks is None:
+            results.append(None)
+            continue
+
+        sol_ids = tok.encode(sol_text, add_special_tokens=False)
+        n_code = sum(1 for b in blocks if b["type"] == "CODE")
+        results.append({
+            "prob_ids": prob_ids,
+            "sol_ids": sol_ids,
+            "n_code": n_code,
+        })
+    return results
+
+
 def _load_solution_lookup(
     solutions_jsonl: str,
     tokenizer_id: str = "bigcode/starcoder2-3b",
-) -> dict[tuple, List[List[int]]]:
+    n_workers: int = 0,
+) -> dict[tuple, List[Tuple[int, List[int]]]]:
     """
     Build a lookup from problem_token_ids → list of (n_blocks, solution_token_ids)
     by reading the raw extracted_solutions.jsonl.
@@ -331,42 +371,62 @@ def _load_solution_lookup(
     problem tokens. At query time, the caller disambiguates by matching
     n_blocks from the SST row against the segmented block count.
 
-    This avoids modifying the SST dataset.
+    Uses multiprocessing for tokenization + segmentation (the bottleneck).
     """
-    from transformers import AutoTokenizer
-    from data.segment_ast import segment_solution_grouped
+    if n_workers == 0:
+        n_workers = min(os.cpu_count() or 1, 16)
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
-    # Key: tuple of problem token IDs
-    # Value: list of (n_blocks, solution_token_ids) tuples
-    lookup: dict[tuple, List[Tuple[int, List[int]]]] = {}
-
-    print(f"  building solution lookup from {solutions_jsonl}...", flush=True)
+    print(f"  building solution lookup from {solutions_jsonl} "
+          f"({n_workers} workers)...", flush=True)
     t0 = time.time()
-    n_read = 0
-    n_segfail = 0
+
+    # Read all lines into memory (JSONL is ~21 GB but we only need the text)
     with open(solutions_jsonl, "r", encoding="utf-8") as f:
-        for line in f:
-            entry = json.loads(line)
-            prob_ids = tuple(tok.encode(entry["problem"], add_special_tokens=False))
-            sol_text = entry["solution"]
-            sol_ids = tok.encode(sol_text, add_special_tokens=False)
+        all_lines = f.readlines()
 
-            # Segment to get n_blocks — must match what SST data prep produced
-            blocks = segment_solution_grouped(sol_text)
-            if blocks is None:
-                n_segfail += 1
-                n_read += 1
-                continue
-            n_code = sum(1 for b in blocks if b["type"] == "CODE")
+    n_total = len(all_lines)
+    print(f"  read {n_total:,} lines in {time.time() - t0:.1f}s, "
+          f"tokenizing...", flush=True)
 
-            lookup.setdefault(prob_ids, []).append((n_code, sol_ids))
-            n_read += 1
+    # Batch lines for worker dispatch
+    batch_size = 2000
+    batches = [
+        all_lines[i : i + batch_size]
+        for i in range(0, n_total, batch_size)
+    ]
+    del all_lines  # free memory
+
+    lookup: dict[tuple, List[Tuple[int, List[int]]]] = {}
+    n_segfail = 0
+    n_ok = 0
+    t1 = time.time()
+
+    with mp.Pool(n_workers, initializer=_lookup_worker_init,
+                 initargs=(tokenizer_id,)) as pool:
+        for batch_results in pool.imap(_lookup_process_batch, batches,
+                                       chunksize=1):
+            for result in batch_results:
+                if result is None:
+                    n_segfail += 1
+                    continue
+                key = tuple(result["prob_ids"])
+                lookup.setdefault(key, []).append(
+                    (result["n_code"], result["sol_ids"])
+                )
+                n_ok += 1
+
+            # Progress
+            done = n_ok + n_segfail
+            if done % 100_000 < batch_size:
+                elapsed = time.time() - t1
+                rate = done / elapsed if elapsed > 0 else 0
+                print(f"    {done:>9,} / {n_total:,}  ({rate:.0f}/s)",
+                      flush=True)
 
     n_unique = len(lookup)
     n_multi = sum(1 for v in lookup.values() if len(v) > 1)
     print(
-        f"  read {n_read:,} entries → {n_unique:,} unique problems "
+        f"  lookup built: {n_ok:,} solutions → {n_unique:,} unique problems "
         f"({n_multi:,} with multiple solutions, {n_segfail:,} seg failures) "
         f"in {time.time() - t0:.1f}s",
         flush=True,
